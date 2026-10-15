@@ -1,0 +1,77 @@
+#!/bin/bash
+# ============================================================
+#  fanlog —— OESP 风扇实时温度 / 状态监控
+#
+#  背景：装了 oesp-fanctl 应用后，旧的 /usr/local/bin/fanctl.sh
+#        已被接管停用，/var/log/fan/fanctl.log 不再更新。
+#        本命令用来替代旧的  tail -f /var/log/fan/fanctl.log
+#
+#  用法：
+#     fanlog           前台实时刷新（默认 3 秒一行，Ctrl+C 退出）
+#     fanlog 1         前台实时刷新，间隔 1 秒
+#     fanlog -f [间隔] 追加写入 /var/log/fan/fanctl.log（可配合后台运行）
+#     fanlog -h        显示帮助
+# ============================================================
+set -u
+
+STATE=/var/apps/oesp-fanctl/var/oesp-fanctl.state
+CPU_NODE=/sys/class/thermal/thermal_zone0/temp
+GPU_NODE=/sys/class/thermal/thermal_zone1/temp
+DISK_NODE=/sys/class/hwmon/hwmon2/temp1_input
+OLD_LOG=/var/log/fan/fanctl.log
+CHIP=gpiochip0
+LINE=45
+
+usage() {
+    sed -n '3,15p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+}
+
+# 毫摄氏度 -> 43.5
+fmt_t() {
+    local v
+    [ -r "$1" ] || { printf '?'; return; }
+    v=$(cat "$1" 2>/dev/null) || { printf '?'; return; }
+    case "$v" in ''|*[!0-9-]*) printf '?'; return ;; esac
+    printf '%d.%d' $((v / 1000)) $(((v % 1000) / 100))
+}
+
+# 风扇状态：优先读 state 文件，其次 gpioget
+fan_state() {
+    local v
+    v=$(grep -o 'fan_state=[0-9]*' "$STATE" 2>/dev/null | head -1 | cut -d= -f2)
+    if [ -z "$v" ]; then
+        v=$(gpioget "$CHIP" "$LINE" 2>/dev/null | tr -dc '0-9' | head -c1)
+    fi
+    printf '%s' "${v:-?}"
+}
+
+line() {
+    printf '[%s] 温度=%s℃ GPU=%s℃ 硬盘=%s℃ 风扇=%s\n' \
+        "$(date '+%F %T')" \
+        "$(fmt_t "$CPU_NODE")" \
+        "$(fmt_t "$GPU_NODE")" \
+        "$(fmt_t "$DISK_NODE")" \
+        "$(fan_state)"
+}
+
+case "${1:-}" in
+    -h|--help|help) usage ;;
+    -f|--file)
+        shift
+        iv="${1:-3}"
+        while :; do
+            line >> "$OLD_LOG"
+            sleep "$iv"
+        done
+        ;;
+    *)
+        iv="${1:-3}"
+        echo "OESP 风扇实时监控（间隔 ${iv}s，Ctrl+C 退出）"
+        echo "CPU开启/关闭阈值: $(grep -oE '^TEMP_(ON|OFF)=[0-9]+' /vol1/@appconf/oesp-fanctl/oesp-fanctl.conf 2>/dev/null | tr '\n' ' ')"
+        while :; do
+            line
+            sleep "$iv"
+        done
+        ;;
+esac

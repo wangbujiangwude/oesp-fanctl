@@ -1,0 +1,576 @@
+#!/bin/bash
+# ============================================================
+#  oesp-fanctl - OESP(OES Plus / Amlogic S922X) 飞牛 fnOS 温控风扇控制
+# ============================================================
+#  硬件事实（2026-10-15 实测结论）：
+#   · 内置 CPU 风扇为 GPIO 二态开关风扇，只有「开 / 关」，不支持转速调节
+#   · 风扇引脚 = gpiochip0 line 45（= 全局 GPIO 557，DTB: gpio-fan gpios 第二字段 0x2d）
+#   · fnOS 1.2.0701 起厂商 DTB 把该引脚由 line 46 改为 line 45 → 写死引脚的老脚本失效
+#
+#  控制通路（本版核心改动）：
+#   ★ 首选 gpio 直控：先 modprobe -r gpio_fan 卸掉内核风扇驱动，
+#     再用 gpioset -m signal 常驻持有 line 45 直接拉高/拉低。
+#     原因：gpio-fan.ko 加载后会把自己注册成 thermal cooling_device，
+#     内核 step_wise 调控器在 <60℃ 时会强行把风扇关掉，导致写 hwmon
+#     fan1_target 的值约 1 秒后被内核覆盖 —— 这条路在本机不可用。
+#   ☆ 回退 hwmon：若系统无 gpioset/gpiod，则退回写 fan1_target
+#     （仅在该机型无 gpio 直控能力时使用，可靠性受内核调控器影响）。
+#
+#  策略特性：
+#   · CPU 迟滞温控：>=TEMP_ON 开，<=TEMP_OFF 关（带连续计数防抖 + 最短运行时间）
+#   · 硬盘定时通风：任一盘 >=HDD_ON_TEMP 开，运行 HDD_RUN_SECONDS 后停机 HDD_COOLDOWN 秒，
+#     间歇结束仍超温则开新一轮，降温则保持关
+#   · 过热紧急保护：CPU / 硬盘过高强制开启（兜底）
+#   · 安装即用：启动自动接管/停掉系统自带风扇控制服务（fanctl / pwm-fancontrol / fan-fullspeed）
+#   · 运行时可改配置（编辑配置文件即 2 秒内生效）
+#
+#  用法：
+#   oesp-fanctl daemon          守护模式（systemd 用）
+#   oesp-fanctl status          查看当前温度/风扇/阈值/后端
+#   oesp-fanctl set on 38       设置 CPU 开启温度
+#   oesp-fanctl set off 35      设置 CPU 关闭温度
+#   oesp-fanctl set hdd 50      设置硬盘定时通风开启温度
+#   oesp-fanctl test on|off     手动开/关风扇测试（一次性，会短暂抢占控制权）
+#   oesp-fanctl restore         释放 GPIO 并恢复系统自带风扇控制（卸载/停用前调用）
+#   oesp-fanctl log             查看运行日志
+# ============================================================
+
+CONF=${OESP_FANCTL_CONF:-/etc/oesp-fanctl.conf}
+LOG=${OESP_FANCTL_LOG:-/var/log/oesp-fanctl.log}
+STATE_FILE=${OESP_FANCTL_STATE:-/run/oesp-fanctl.state}
+HISTORY_FILE=${OESP_FANCTL_HISTORY:-/var/log/oesp-fanctl-history.csv}
+WEB_PORT=${WEB_PORT:-8765}
+
+# ---------- 默认配置（配置文件不存在时用；OESP 机型默认值） ----------
+TEMP_ON=38              # CPU 高于此温度开风扇（℃）—— 沿用用户原 fanctl.sh 设置
+TEMP_OFF=35             # CPU 低于此温度关风扇（℃）—— 沿用用户原 fanctl.sh 设置
+HDD_ON_TEMP=50          # 任一硬盘达到此温度启动定时通风（℃）
+HDD_RUN_SECONDS=60      # 硬盘触发后风扇运行时长（秒），到时自动关闭
+HDD_COOLDOWN=60         # 通风结束后强制停机间歇（秒）；间歇结束若仍超温则再开新一轮
+EMERGENCY_TEMP=70       # CPU 超过此温度强制开启风扇（℃）
+DISK_EMERGENCY_TEMP=55  # 任一硬盘超过此温度强制开启风扇（℃，纯兜底）
+INTERVAL=2              # 检测周期（秒）
+STABLE_COUNT=3          # CPU 连续 N 次超温才启动风扇（防抖动）
+MIN_RUN=60              # CPU 温控风扇最短运行时间（秒）
+DISK_CHECK_CYCLES=10    # 每 N 个周期读一次硬盘温度（smartctl 开销大）
+
+load_conf() {
+    [ -f "$CONF" ] && . "$CONF"
+}
+
+# ============================================================
+#  GPIO 直控后端（OESP 首选）
+# ============================================================
+GPIO_CHIP="gpiochip0"
+GPIO_LINE=""            # 运行时探测
+GPIO_PID=""             # 常驻持有的 gpioset 进程
+GPIO_CUR=""             # 当前持有的电平：0=关 1=开
+FAN_BACKEND=""          # "gpio" | "hwmon"
+FAN_NODE=""             # hwmon 回退时的 fan1_target 路径
+
+# 从设备树读取风扇 GPIO offset（硬件权威描述），失败兜底 45
+dt_gpio_line() {
+    local dt=/sys/firmware/devicetree/base/gpio-fan/gpios off
+    if [ -r "$dt" ]; then
+        # gpios = <phandle offset flags>，大端 3 个 u32；取第 2 个
+        off=$(od -An -tu4 --endian=big "$dt" 2>/dev/null | awk '{print $2}')
+        case "$off" in
+            ''|*[!0-9]*) : ;;
+            *) [ "$off" -lt 200 ] && { echo "$off"; return 0; } ;;
+        esac
+    fi
+    echo 45
+}
+
+gpio_fan_loaded() { lsmod 2>/dev/null | grep -q '^gpio_fan'; }
+
+# 卸载 gpio_fan 内核驱动，释放引脚给用户态 gpioset
+release_gpio_fan() {
+    gpio_fan_loaded || return 0
+    modprobe -r gpio_fan 2>/dev/null && return 0
+    return 1
+}
+
+# 重新加载 gpio_fan，恢复厂商 60℃ 内核温控（卸载/停用本应用时调用）
+restore_gpio_fan() {
+    gpio_fan_loaded && return 0
+    modprobe gpio_fan 2>/dev/null
+}
+
+# ============================================================
+#  后端探测
+# ============================================================
+detect_backend() {
+    FAN_BACKEND=""; FAN_NODE=""
+    # 1) gpio 直控（首选）
+    if command -v gpioset >/dev/null 2>&1 && [ -e "/dev/$GPIO_CHIP" ]; then
+        GPIO_LINE=$(dt_gpio_line)
+        FAN_BACKEND="gpio"
+        return 0
+    fi
+    # 2) hwmon 回退（写 fan1_target）
+    local f
+    for f in /sys/devices/platform/gpio-fan/hwmon/hwmon*/fan1_target; do
+        [ -w "$f" ] && { FAN_NODE="$f"; FAN_BACKEND="hwmon"; return 0; }
+    done
+    for f in /sys/class/hwmon/hwmon*/fan1_target; do
+        [ -w "$f" ] && grep -q "gpio" "$(dirname "$f")/name" 2>/dev/null \
+            && { FAN_NODE="$f"; FAN_BACKEND="hwmon"; return 0; }
+    done
+    return 1
+}
+
+# 统一写风扇：set_fan <0|1>
+set_fan() {
+    local val=$1
+    case "$FAN_BACKEND" in
+        gpio)
+            # 常驻持有引脚；仅当状态变化或进程已死时才重启 gpioset
+            if [ "$val" = "$GPIO_CUR" ] && [ -n "$GPIO_PID" ] && kill -0 "$GPIO_PID" 2>/dev/null; then
+                return 0
+            fi
+            [ -n "$GPIO_PID" ] && kill "$GPIO_PID" 2>/dev/null
+            gpioset -m signal "$GPIO_CHIP" "$GPIO_LINE=$val" >/dev/null 2>&1 &
+            GPIO_PID=$!
+            GPIO_CUR=$val
+            sleep 0.1
+            ;;
+        hwmon)
+            [ -n "$FAN_NODE" ] && echo "$val" > "$FAN_NODE" 2>/dev/null
+            ;;
+    esac
+}
+
+read_fan() {
+    case "$FAN_BACKEND" in
+        gpio)
+            # 守护进程内：直接用运行时变量
+            if [ -n "${GPIO_CUR:-}" ]; then echo "$GPIO_CUR"; return; fi
+            # 独立进程（如 oesp-fanctl status）：变量为空，
+            # 从 state 文件读守护进程上报的实际状态（引脚被 gpioset 持有，gpioget 会 EBUSY）
+            local v="" sf
+            for sf in "$STATE_FILE" /vol1/@appdata/oesp-fanctl/oesp-fanctl.state /run/oesp-fanctl.state; do
+                [ -f "$sf" ] || continue
+                v=$(grep -o 'fan_state=[0-9]*' "$sf" 2>/dev/null | head -1 | cut -d= -f2)
+                [ -n "$v" ] && break
+            done
+            [ -z "$v" ] && v=$(gpioget "$GPIO_CHIP" "$GPIO_LINE" 2>/dev/null | tr -dc '0-9' | head -c1)
+            echo "${v:-?}"
+            ;;
+        hwmon) cat "$FAN_NODE" 2>/dev/null || echo "?" ;;
+        *)     echo "?" ;;
+    esac
+}
+
+# 停掉与风扇抢控制权的系统服务（安装即用：自动接管）
+takeover_services() {
+    local svc
+    for svc in fanctl.service pwm-fancontrol.service fan-fullspeed.service; do
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            systemctl stop "$svc" 2>/dev/null && log "已停止冲突服务 $svc"
+        fi
+        systemctl disable "$svc" 2>/dev/null
+    done
+    # 杀掉非 systemd 托管的裸脚本（用户旧版 fanctl.sh 等）
+    pkill -f 'fanctl\.sh' 2>/dev/null
+}
+
+get_temp() {  # 一位小数温度（℃）
+    local t
+    t=$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo 0)
+    printf '%d.%d' $(( t / 1000 )) $(( (t % 1000) / 100 ))
+}
+
+# ---------- GPU 温度探测 ----------
+GPU_NODE=""
+detect_gpu() {
+    GPU_NODE=""
+    local z
+    for z in /sys/class/thermal/thermal_zone*; do
+        case "$(cat "$z/type" 2>/dev/null)" in
+            *gpu*|*GPU*|*gpu-thermal*)
+                [ -f "$z/temp" ] && { GPU_NODE="$z/temp"; return; } ;;
+        esac
+    done
+    [ -f /sys/class/thermal/thermal_zone1/temp ] \
+        && GPU_NODE=/sys/class/thermal/thermal_zone1/temp
+}
+
+get_gpu_temp() {
+    [ -z "$GPU_NODE" ] && { echo 0; return; }
+    local t
+    t=$(cat "$GPU_NODE" 2>/dev/null || echo 0)
+    printf '%d.%d' $(( t / 1000 )) $(( (t % 1000) / 100 ))
+}
+
+# ---------- 硬盘温度探测 ----------
+DISK_SOURCES=()
+DISK_LABELS=()
+detect_disks() {
+    DISK_SOURCES=(); DISK_LABELS=()
+    local h d lbl b
+    for h in /sys/class/hwmon/hwmon*; do
+        if [ "$(cat "$h/name" 2>/dev/null)" = "drivetemp" ] && [ -f "$h/temp1_input" ]; then
+            lbl=""
+            for b in "$h/device"/block/*; do [ -e "$b" ] && lbl=$(basename "$b"); done
+            [ -z "$lbl" ] && lbl=$(basename "$(readlink -f "$h/device" 2>/dev/null)" 2>/dev/null)
+            [ -z "$lbl" ] && lbl="disk${#DISK_SOURCES[@]}"
+            DISK_SOURCES+=("$h/temp1_input"); DISK_LABELS+=("$lbl")
+        fi
+    done
+    if [ ${#DISK_SOURCES[@]} -eq 0 ] && command -v smartctl >/dev/null 2>&1; then
+        for d in /dev/sd? /dev/nvme?; do
+            [ -b "$d" ] && { DISK_SOURCES+=("smart:$d"); DISK_LABELS+=("$(basename "$d")"); }
+        done
+    fi
+}
+
+DISK_TEMPS_OUT=""
+DISK_MAX_TEMP=0
+read_disk_temps() {
+    DISK_TEMPS_OUT=""; DISK_MAX_TEMP=0
+    local i s t ti
+    for i in "${!DISK_SOURCES[@]}"; do
+        s="${DISK_SOURCES[$i]}"; t=0
+        case "$s" in
+            smart:*)
+                ti=$(smartctl -n standby -A "${s#smart:}" 2>/dev/null \
+                    | awk '/Temperature_Celsius/{print $10; exit} /^Temperature:/{print $2; exit}')
+                [ -n "$ti" ] && t="${ti}.0" ;;
+            *)
+                ti=$(cat "$s" 2>/dev/null || echo 0)
+                t=$(printf '%d.%d' $(( ti / 1000 )) $(( (ti % 1000) / 100 ))) ;;
+        esac
+        [ -z "$t" ] && t=0
+        DISK_TEMPS_OUT="${DISK_TEMPS_OUT}${DISK_LABELS[$i]}=$t
+"
+        [ "${t%.*}" -gt "$DISK_MAX_TEMP" ] 2>/dev/null && DISK_MAX_TEMP=${t%.*}
+    done
+}
+
+log() {
+    local line="[$(date '+%F %T')] $1"
+    echo "$line" >> "$LOG"
+    if [ "$(stat -c%s "$LOG" 2>/dev/null || echo 0)" -gt 1048576 ]; then
+        tail -n 500 "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+    fi
+}
+
+# ---------- 守护主循环 ----------
+WEB_PID=""
+cleanup() {
+    [ -n "$WEB_PID" ] && kill "$WEB_PID" 2>/dev/null
+    # 释放 GPIO：结束常驻 gpioset 进程（引脚归还硬件默认状态）
+    if [ "$FAN_BACKEND" = "gpio" ] && [ -n "$GPIO_PID" ]; then
+        kill "$GPIO_PID" 2>/dev/null
+        GPIO_PID=""
+    fi
+    log "守护进程退出"
+    exit 0
+}
+
+cmd_daemon() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "需要 root 权限运行"; exec sudo "$0" daemon
+    fi
+    mkdir -p "$(dirname "$LOG")" "$(dirname "$STATE_FILE")" "$(dirname "$HISTORY_FILE")" 2>/dev/null
+    load_conf
+
+    if ! detect_backend; then
+        echo "错误：找不到风扇控制通路（gpioset 与 fan1_target 均不可用）"
+        echo "请确认 dtb 为 OES Plus 适配版本（含 gpio-fan 节点），或安装 gpiod：apt install gpiod"
+        exit 1
+    fi
+
+    # 接管系统服务（安装即用：不与任何既有风扇控制打架）
+    takeover_services
+
+    if [ "$FAN_BACKEND" = "gpio" ]; then
+        if release_gpio_fan; then
+            log "已卸载 gpio_fan 驱动，改用 gpio 直控（$GPIO_CHIP line $GPIO_LINE）"
+        else
+            log "警告：gpio_fan 驱动卸载失败，尝试直接用 gpioset 抢占引脚"
+        fi
+        log "启动 oesp-fanctl，后端=gpio（$GPIO_CHIP line $GPIO_LINE，0=关 1=开）"
+    else
+        log "启动 oesp-fanctl，后端=hwmon（$FAN_NODE）"
+        log "提示：gpio-fan 内核调控器可能在 <60℃ 时覆盖本工具写入，建议安装 gpiod 以启用 gpio 直控"
+    fi
+
+    detect_gpu
+    [ -n "$GPU_NODE" ] && log "GPU 温度节点: $GPU_NODE"
+
+    # --- 启动 Web 监控页 ---
+    start_web() {
+        command -v python3 >/dev/null 2>&1 || { log "无 python3，Web 监控页不可用（风扇控制不受影响）"; return; }
+        local sd ws="" c
+        sd=$(dirname "$(readlink -f "$0")" 2>/dev/null)
+        for c in "${OESP_FANCTL_WEBSCRIPT:-}" "$sd/fanweb.py" /usr/local/bin/fanweb.py "${TRIM_APPDEST:-/nonexistent}/fanweb.py"; do
+            [ -n "$c" ] && [ -f "$c" ] && { ws="$c"; break; }
+        done
+        [ -z "$ws" ] && { log "未找到 fanweb.py，Web 监控页不可用"; return; }
+        OESP_FANCTL_CONF="$CONF" OESP_FANCTL_STATE="$STATE_FILE" OESP_FANCTL_HISTORY="$HISTORY_FILE" \
+        WEB_PORT="$WEB_PORT" nohup python3 "$ws" >> "$LOG" 2>&1 &
+        WEB_PID=$!
+        log "Web 监控页已启动: http://0.0.0.0:${WEB_PORT} (pid $WEB_PID)"
+    }
+    trap cleanup EXIT TERM INT
+    start_web
+
+    # --- 状态变量 ---
+    local cpu_fan=0
+    local cpu_fan_start=0
+    local high_count=0
+    local emergency=0
+    local hdd_run_until=0
+    local hdd_cool_until=0
+    local fan_state=0
+    local cycle=0
+    local dmax=0
+
+    detect_disks
+    if [ "${#DISK_SOURCES[@]}" -gt 0 ]; then
+        log "硬盘温度源 ${#DISK_SOURCES[@]} 个: ${DISK_SOURCES[*]}"
+    else
+        log "未找到硬盘温度源（可执行 modprobe drivetemp 后重启本服务），仅按 CPU 温度控制"
+    fi
+
+    # 初始释放：先关风扇，交由主循环按温度决策
+    set_fan 0
+
+    while true; do
+        load_conf
+        local temp_f=$(get_temp)
+        local temp=${temp_f%.*}
+        local now=$(date +%s)
+        cycle=$((cycle + 1))
+
+        if [ "${#DISK_SOURCES[@]}" -gt 0 ]; then
+            if [ $(( cycle % DISK_CHECK_CYCLES )) -eq 1 ] || [ "$cycle" -eq 1 ]; then
+                read_disk_temps
+            fi
+            [ $(( cycle % 150 )) -eq 0 ] && detect_disks
+        else
+            DISK_TEMPS_OUT=""; DISK_MAX_TEMP=0
+        fi
+        dmax=$DISK_MAX_TEMP
+        local gpu_f=$(get_gpu_temp)
+
+        # --- CPU 温控（迟滞 + 最短运行）---
+        local cpu_hot=0 cpu_cold=1
+        [ "$temp" -ge "$TEMP_ON" ] && cpu_hot=1
+        [ "$temp" -gt "$TEMP_OFF" ] && cpu_cold=0
+        if [ "$cpu_hot" -eq 1 ]; then
+            high_count=$((high_count + 1))
+            if [ "$cpu_fan" -eq 0 ] && [ "$high_count" -ge "$STABLE_COUNT" ]; then
+                cpu_fan=1; cpu_fan_start=$now
+                log "CPU ${temp_f}℃ >= ${TEMP_ON}℃，风扇启动（CPU 温控）"
+            fi
+        elif [ "$cpu_cold" -eq 1 ]; then
+            high_count=0
+            if [ "$cpu_fan" -eq 1 ]; then
+                local run_secs=$(( now - cpu_fan_start ))
+                if [ "$run_secs" -ge "$MIN_RUN" ]; then
+                    cpu_fan=0; cpu_fan_start=0
+                    log "CPU ${temp_f}℃ <= ${TEMP_OFF}℃，CPU 温控风扇停止"
+                fi
+            fi
+        else
+            high_count=0
+        fi
+
+        # --- 过热紧急保护（带 5℃ 迟滞）---
+        local cpu_emerg=0 disk_emerg=0
+        if [ "$emergency" -eq 1 ]; then
+            [ "$temp" -ge $((EMERGENCY_TEMP - 5)) ] && cpu_emerg=1
+            [ "$dmax" -gt 0 ] && [ "$dmax" -ge $((DISK_EMERGENCY_TEMP - 5)) ] && disk_emerg=1
+        else
+            [ "$temp" -ge "$EMERGENCY_TEMP" ] && cpu_emerg=1
+            [ "$dmax" -gt 0 ] && [ "$dmax" -ge "$DISK_EMERGENCY_TEMP" ] && disk_emerg=1
+        fi
+        if [ "$cpu_emerg" -eq 1 ] || [ "$disk_emerg" -eq 1 ]; then
+            if [ "$emergency" -eq 0 ]; then
+                log "!! 过热 CPU ${temp_f}℃ / 硬盘 ${dmax}℃，强制开启风扇"
+            fi
+            emergency=1
+        else
+            emergency=0
+        fi
+
+        # --- 硬盘定时通风（间歇式）---
+        local hdd_want_on=0
+        if [ "$now" -lt "$hdd_run_until" ]; then
+            hdd_want_on=1
+        elif [ "$now" -lt "$hdd_cool_until" ]; then
+            hdd_want_on=0
+        elif [ "$dmax" -gt 0 ] && [ "$dmax" -ge "$HDD_ON_TEMP" ]; then
+            hdd_run_until=$(( now + HDD_RUN_SECONDS ))
+            hdd_cool_until=$(( hdd_run_until + HDD_COOLDOWN ))
+            hdd_want_on=1
+            log "硬盘 ${dmax}℃ 仍 >= ${HDD_ON_TEMP}℃，新一轮定时通风（运行 ${HDD_RUN_SECONDS}s，停机间歇 ${HDD_COOLDOWN}s）"
+        else
+            hdd_want_on=0
+        fi
+
+        # --- 综合判定（二态）：任一来源要求开即开 ---
+        local want_on=0
+        [ "$cpu_fan" -eq 1 ] && want_on=1
+        [ "$hdd_want_on" -eq 1 ] && want_on=1
+        [ "$emergency" -eq 1 ] && want_on=1
+        if [ "$want_on" -ne "$fan_state" ]; then
+            fan_state=$want_on
+            if [ "$fan_state" -eq 1 ]; then
+                log "风扇 → 开启（CPU温控=${cpu_fan} 硬盘通风=${hdd_want_on} 紧急=${emergency}）"
+            else
+                log "风扇 → 关闭"
+            fi
+        fi
+
+        set_fan "$fan_state"
+
+        # --- 状态文件（Web 页读取）---
+        {
+            echo "temp=$temp_f"
+            echo "gpu=$gpu_f"
+            echo "fan_state=$fan_state"
+            echo "fan_target=$fan_state"
+            echo "backend=$FAN_BACKEND"
+            echo "disk_max=$dmax"
+            echo "$DISK_TEMPS_OUT" | while IFS='=' read -r k v; do
+                [ -n "$k" ] && echo "disk_$k=$v"
+            done
+            echo "ts=$now"
+        } > "$STATE_FILE"
+
+        # --- 历史曲线：每 30 周期（约60秒）记一个点，保留 12 小时 ---
+        if [ $(( cycle % 30 )) -eq 1 ]; then
+            local d1="" d2="" d3="" di=0 dv
+            while IFS='=' read -r _ dv; do
+                [ -z "$_" ] && continue
+                di=$((di+1))
+                case $di in 1) d1=$dv;; 2) d2=$dv;; 3) d3=$dv;; esac
+            done <<< "$DISK_TEMPS_OUT"
+            echo "$now,$temp_f,$gpu_f,$d1,$d2,$d3,$fan_state" >> "$HISTORY_FILE"
+            if [ $(( cycle % 600 )) -eq 1 ] && [ -f "$HISTORY_FILE" ]; then
+                tail -n 720 "$HISTORY_FILE" > "$HISTORY_FILE.tmp" 2>/dev/null \
+                    && mv "$HISTORY_FILE.tmp" "$HISTORY_FILE"
+            fi
+        fi
+
+        sleep "$INTERVAL"
+    done
+}
+
+# 风扇状态文字（0=关 1=开 其他=未知）
+fan_state_text() {
+    case "$(read_fan)" in
+        0) echo "关闭" ;;
+        1) echo "开启" ;;
+        *) echo "未知" ;;
+    esac
+}
+
+# ---------- 状态查看 ----------
+cmd_status() {
+    load_conf
+    detect_backend 2>/dev/null
+    echo "===== oesp-fanctl 状态 ====="
+    case "$FAN_BACKEND" in
+        gpio)
+            echo "控制后端:  gpio 直控（$GPIO_CHIP line $GPIO_LINE）"
+            echo "风扇状态:  $(fan_state_text)  (0=关, 1=开)"
+            ;;
+        hwmon)
+            echo "控制后端:  hwmon（$FAN_NODE）"
+            echo "风扇状态:  $(fan_state_text)  (0=关, 非0=开)"
+            ;;
+        *)
+            echo "控制后端:  未找到！";;
+    esac
+    echo "CPU 温度:  $(get_temp) ℃"
+    detect_gpu
+    [ -n "$GPU_NODE" ] && echo "GPU 温度:  $(get_gpu_temp) ℃"
+    detect_disks
+    if [ "${#DISK_SOURCES[@]}" -gt 0 ]; then
+        read_disk_temps
+        echo "硬盘温度:  $(echo "$DISK_TEMPS_OUT" | tr '\n' ' ')（最高 ${DISK_MAX_TEMP} ℃）"
+    else
+        echo "硬盘温度:  无温度源（可 modprobe drivetemp）"
+    fi
+    echo "Web 监控:  http://NAS地址:${WEB_PORT}"
+    echo "CPU 开启/关闭阈值:  ${TEMP_ON} / ${TEMP_OFF} ℃"
+    echo "硬盘定时通风阈值:  ${HDD_ON_TEMP} ℃（触发后运行 ${HDD_RUN_SECONDS}s，停机间歇 ${HDD_COOLDOWN}s）"
+    echo "紧急强制开启:  CPU ${EMERGENCY_TEMP} ℃ / 硬盘 ${DISK_EMERGENCY_TEMP} ℃（兜底保护）"
+    if [ -f "$STATE_FILE" ]; then
+        echo "----- 守护进程实时状态 -----"
+        cat "$STATE_FILE"
+    fi
+    if pgrep -f "oesp-fanctl daemon" >/dev/null 2>&1; then
+        echo "守护进程:  运行中"
+    elif systemctl is-active oesp-fanctl.service >/dev/null 2>&1; then
+        echo "守护进程:  运行中（systemd: oesp-fanctl.service）"
+    else
+        echo "守护进程:  未运行"
+    fi
+}
+
+# ---------- 修改配置 ----------
+cmd_set() {
+    [ "$(id -u)" -ne 0 ] && exec sudo "$0" set "$@"
+    [ -f "$CONF" ] || { echo "配置文件 $CONF 不存在，请先安装"; exit 1; }
+    local key=$1 val=$2
+    case "$key" in
+        on)    [ "$val" -gt 0 ] 2>/dev/null || { echo "温度需为正整数"; exit 1; }
+               sed -i "s/^TEMP_ON=.*/TEMP_ON=$val/" "$CONF" ;;
+        off)   [ "$val" -gt 0 ] 2>/dev/null || { echo "温度需为正整数"; exit 1; }
+               sed -i "s/^TEMP_OFF=.*/TEMP_OFF=$val/" "$CONF" ;;
+        hdd)   [ "$val" -gt 0 ] 2>/dev/null || { echo "温度需为正整数"; exit 1; }
+               sed -i "s/^HDD_ON_TEMP=.*/HDD_ON_TEMP=$val/" "$CONF" ;;
+        *) echo "用法: oesp-fanctl set <on|off|hdd> <值>"; exit 1 ;;
+    esac
+    echo "已更新，守护进程 2 秒内自动生效："
+    grep -E "^(TEMP_ON|TEMP_OFF|HDD_ON_TEMP)=" "$CONF"
+}
+
+# ---------- 手动测试 ----------
+cmd_test() {
+    [ "$(id -u)" -ne 0 ] && exec sudo "$0" test "$@"
+    detect_backend || { echo "找不到风扇控制通路"; exit 1; }
+    case "$1" in
+        on)  echo "开启(1) → 后端 $FAN_BACKEND"; set_fan 1; echo "OK，当前读回: $(read_fan)" ;;
+        off) echo "关闭(0) → 后端 $FAN_BACKEND"; set_fan 0; echo "OK，当前读回: $(read_fan)" ;;
+        *)   echo "用法: oesp-fanctl test <on|off>"; exit 1 ;;
+    esac
+    echo "注意：守护进程运行时会在下个周期覆盖此值；测试后请用 restore 或重启服务"
+}
+
+# ---------- 释放并恢复系统风扇控制（卸载/停用前调用） ----------
+cmd_restore() {
+    [ "$(id -u)" -ne 0 ] && exec sudo "$0" restore
+    # 结束可能残留的 gpioset 进程
+    pkill -f "gpioset -m signal $GPIO_CHIP" 2>/dev/null
+    # 重新加载 gpio_fan，恢复厂商 60℃ 内核温控
+    if restore_gpio_fan; then
+        echo "已重新加载 gpio_fan 驱动，恢复系统内核温控（约 60℃ 开启）"
+    else
+        echo "提示：未能加载 gpio_fan 驱动（可能无此模块），风扇将处于硬件默认状态"
+    fi
+    # 恢复系统自带 pwm 风扇服务（若存在）
+    for svc in pwm-fancontrol.service fan-fullspeed.service; do
+        if [ -f "/usr/lib/systemd/system/$svc" ] || [ -f "/etc/systemd/system/$svc" ]; then
+            systemctl enable "$svc" 2>/dev/null
+            systemctl start "$svc" 2>/dev/null
+            echo "已恢复系统服务 $svc"
+        fi
+    done
+}
+
+case "$1" in
+    daemon|"") cmd_daemon ;;
+    status)    cmd_status ;;
+    set)       cmd_set "$2" "$3" ;;
+    test)      cmd_test "$2" ;;
+    restore)   cmd_restore ;;
+    log)       tail -n 30 "$LOG" 2>/dev/null || echo "暂无日志" ;;
+    *)         echo "用法: oesp-fanctl <daemon|status|set|test|restore|log>"; exit 1 ;;
+esac

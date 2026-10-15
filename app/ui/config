@@ -1,0 +1,15 @@
+{
+    ".url": {
+        "oesp-fanctl.Application": {
+            "title": "OESP风扇助手",
+            "desc": "OES Plus（S922X）温控风扇监控",
+            "icon": "images/icon_{0}.png",
+            "type": "iframe",
+            "protocol": "",
+            "gatewaySocket": "target/app.sock",
+            "gatewayPrefix": "/app/oesp-fanctl",
+            "url": "/app/oesp-fanctl",
+            "allUsers": false
+        }
+    }
+}

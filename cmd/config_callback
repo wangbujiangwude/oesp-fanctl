@@ -1,0 +1,5 @@
+#!/bin/bash
+
+### This script is called before/after the user configures the application.
+
+exit 0

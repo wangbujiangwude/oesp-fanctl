@@ -1,0 +1,37 @@
+#!/bin/bash
+# 卸载后：释放 GPIO、重新加载 gpio_fan 内核驱动、恢复系统自带风扇控制（回到 fnOS 默认 ~60℃ 策略）
+DAEMON="${TRIM_APPDEST}/oesp-fanctl"
+
+# 1. 停止可能残留的守护进程
+PID_FILE="${TRIM_PKGVAR}/oesp-fanctl.pid"
+if [ -f "$PID_FILE" ]; then
+    pid=$(cat "$PID_FILE" | tr -d '[:space:]')
+    [ -n "$pid" ] && kill "$pid" 2>/dev/null
+    sleep 1
+    [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null
+    rm -f "$PID_FILE"
+fi
+
+# 2. 调用 daemon 的 restore：结束 gpioset、重新加载 gpio_fan、恢复系统风扇服务
+if [ -x "$DAEMON" ]; then
+    "$DAEMON" restore 2>/dev/null
+else
+    # 兜底：直接重新加载 gpio_fan 并恢复系统服务
+    pkill -f 'gpioset -m signal gpiochip0' 2>/dev/null
+    modprobe gpio_fan 2>/dev/null
+    for svc in pwm-fancontrol.service fan-fullspeed.service; do
+        if [ -f "/usr/lib/systemd/system/$svc" ] || [ -f "/etc/systemd/system/$svc" ]; then
+            systemctl enable "$svc" 2>/dev/null
+            systemctl start "$svc" 2>/dev/null
+        fi
+    done
+fi
+
+# 3. 按向导选择处理数据（wizard_data_action: keep | delete）
+ACTION="${wizard_data_action:-keep}"
+if [ "$ACTION" = "delete" ]; then
+    rm -f "${TRIM_PKGETC}/oesp-fanctl.conf" 2>/dev/null
+    rm -f "${TRIM_PKGVAR}/oesp-fanctl.log" "${TRIM_PKGVAR}/oesp-fanctl.state" "${TRIM_PKGVAR}/history.csv" 2>/dev/null
+fi
+
+exit 0

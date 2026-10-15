@@ -1,0 +1,16 @@
+# 统一锁定行尾为 LF（Windows 上 core.autocrlf=true 会把 .sh 检出成 CRLF 导致 shebang 失效）
+* text=auto eol=lf
+
+# 脚本 / 源码：强制 LF
+*.sh    text eol=lf
+*.py    text eol=lf
+*.md    text eol=lf
+cmd/*   text eol=lf
+tools/* text eol=lf
+manifest text eol=lf
+
+# 二进制：不做任何转换
+*.fpk   binary
+*.PNG   binary
+*.png   binary
+*.tgz   binary

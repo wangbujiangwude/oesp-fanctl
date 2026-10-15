@@ -1,0 +1,62 @@
+#!/bin/bash
+# 安装后：探测风扇控制通路、停掉冲突服务、装好依赖、写入配置（含向导阈值）
+# OESP(OES Plus) 适配：优先 gpio 直控（gpioset），回退 hwmon fan1_target
+err_log() { [ -n "$TRIM_TEMP_LOGFILE" ] && echo "$1" >> "$TRIM_TEMP_LOGFILE"; }
+
+DAEMON="${TRIM_APPDEST}/oesp-fanctl"
+
+# 1. 探测风扇控制通路：gpio 直控（gpioset）或 hwmon fan1_target，两者皆无则安装失败
+GPIO_OK=0; HWMON_OK=0
+if command -v gpioset >/dev/null 2>&1 && [ -e /dev/gpiochip0 ]; then
+    GPIO_OK=1
+fi
+for f in /sys/devices/platform/gpio-fan/hwmon/hwmon*/fan1_target; do
+    [ -e "$f" ] && { HWMON_OK=1; break; }
+done
+
+if [ "$GPIO_OK" -eq 0 ] && [ "$HWMON_OK" -eq 0 ]; then
+    # 尝试安装 gpiod（提供 gpioset）
+    err_log "未检测到 gpioset，尝试安装 gpiod..."
+    apt-get update -qq 2>/dev/null && apt-get install -y -qq gpiod 2>/dev/null
+    if command -v gpioset >/dev/null 2>&1 && [ -e /dev/gpiochip0 ]; then
+        GPIO_OK=1
+    fi
+fi
+
+if [ "$GPIO_OK" -eq 0 ] && [ "$HWMON_OK" -eq 0 ]; then
+    err_log "未找到风扇控制通路：既无 gpioset/gpiochip0，也无 gpio-fan/fan1_target。请确认当前 dtb 为 OES Plus 适配版本（fdtfile 含 oes-plus），否则本应用无法控制风扇。"
+    exit 1
+fi
+
+# 2. 停掉与风扇抢控制权的系统服务（安装即用：自动接管）
+for svc in fanctl.service pwm-fancontrol.service fan-fullspeed.service; do
+    systemctl stop "$svc" 2>/dev/null
+    systemctl disable "$svc" 2>/dev/null
+done
+rm -f /etc/systemd/system/fan-fullspeed.service
+rm -f /etc/systemd/system/multi-user.target.wants/fan-fullspeed.service
+systemctl daemon-reload 2>/dev/null
+# 杀掉非 systemd 托管的旧版裸脚本
+pkill -f 'fanctl\.sh' 2>/dev/null
+
+# 3. 生成配置文件（默认 CPU 45/38、硬盘 50，安装后可在 Web 页内修改）
+CONF_FILE="${TRIM_PKGETC}/oesp-fanctl.conf"
+if [ ! -f "$CONF_FILE" ]; then
+    cp "${TRIM_APPDEST}/oesp-fanctl.conf.default" "$CONF_FILE"
+fi
+
+# 4. 尝试加载 drivetemp（hwmon 方式读硬盘温度，不吵醒休眠盘；失败则回退 smartctl）
+modprobe drivetemp 2>/dev/null
+if ! grep -q '^drivetemp$' /etc/modules 2>/dev/null; then
+    echo drivetemp >> /etc/modules 2>/dev/null
+fi
+
+# 5. Web 监控页依赖 python3（缺失则尝试安装；失败不影响风扇控制本体）
+if ! command -v python3 >/dev/null 2>&1; then
+    err_log "提示：系统无 python3，正在尝试安装（Web 监控页需要，风扇控制不受影响）..."
+    apt-get update -qq 2>/dev/null && apt-get install -y -qq python3 2>/dev/null
+    command -v python3 >/dev/null 2>&1 \
+        || err_log "python3 安装失败，Web 监控页将不可用；风扇温控功能不受影响。可稍后手动执行 apt install python3 后重启本应用。"
+fi
+
+exit 0

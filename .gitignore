@@ -1,0 +1,33 @@
+# 构建中间产物
+app.tgz
+build/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# 运行时目录
+app/target/
+*.state
+*.pid
+*.log
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 调试与部署脚本（含本机信息，不入库）
+*_probe.sh
+*_test.sh
+probe_*.sh
+scan_*.sh
+deploy_*.sh
+sync_*.sh
+do_install*.sh
+reinstall_*.sh
+*_tunnel.py
+_proxy_tunnel.py
+_shot_*.png
+*.bundle
