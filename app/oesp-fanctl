@@ -175,9 +175,13 @@ takeover_services() {
     pkill -f 'fanctl\.sh' 2>/dev/null
 }
 
-get_temp() {  # 一位小数温度（℃）
+get_temp_milli() {  # 原始毫摄氏度整数（不做任何截断，专用于精确比较）
+    cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo 0
+}
+
+get_temp() {  # 一位小数温度（℃），仅用于显示/记录
     local t
-    t=$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo 0)
+    t=$(get_temp_milli)
     printf '%d.%d' $(( t / 1000 )) $(( (t % 1000) / 100 ))
 }
 
@@ -340,8 +344,13 @@ cmd_daemon() {
 
     while true; do
         load_conf
-        local temp_f=$(get_temp)
-        local temp=${temp_f%.*}
+        # tm = 毫摄氏度原始值，用于精确比较；temp_f = 一位小数，仅用于显示/记录
+        # ⚠ 不能用 ${temp_f%.*} 做比较：那会把 35.9℃ 截断成 35，
+        #   使「温度还没到 TEMP_OFF 就提前关风扇」（FPK 1.6 原版的遗留 BUG）。
+        local tm=$(get_temp_milli)
+        # temp_f 由同一个 tm 派生（只读一次传感器），否则日志温度与判定温度会不一致，
+        # 出现「CPU 35.2℃ <= 35℃，风扇停止」这类看起来自相矛盾的行。
+        local temp_f=$(printf '%d.%d' $(( tm / 1000 )) $(( (tm % 1000) / 100 )))
         local now=$(date +%s)
         cycle=$((cycle + 1))
 
@@ -358,8 +367,8 @@ cmd_daemon() {
 
         # --- CPU 温控（迟滞 + 最短运行）---
         local cpu_hot=0 cpu_cold=1
-        [ "$temp" -ge "$TEMP_ON" ] && cpu_hot=1
-        [ "$temp" -gt "$TEMP_OFF" ] && cpu_cold=0
+        [ "$tm" -ge $(( TEMP_ON  * 1000 )) ] && cpu_hot=1
+        [ "$tm" -gt $(( TEMP_OFF * 1000 )) ] && cpu_cold=0
         if [ "$cpu_hot" -eq 1 ]; then
             high_count=$((high_count + 1))
             if [ "$cpu_fan" -eq 0 ] && [ "$high_count" -ge "$STABLE_COUNT" ]; then
@@ -382,10 +391,10 @@ cmd_daemon() {
         # --- 过热紧急保护（带 5℃ 迟滞）---
         local cpu_emerg=0 disk_emerg=0
         if [ "$emergency" -eq 1 ]; then
-            [ "$temp" -ge $((EMERGENCY_TEMP - 5)) ] && cpu_emerg=1
+            [ "$tm" -ge $(( (EMERGENCY_TEMP - 5) * 1000 )) ] && cpu_emerg=1
             [ "$dmax" -gt 0 ] && [ "$dmax" -ge $((DISK_EMERGENCY_TEMP - 5)) ] && disk_emerg=1
         else
-            [ "$temp" -ge "$EMERGENCY_TEMP" ] && cpu_emerg=1
+            [ "$tm" -ge $(( EMERGENCY_TEMP * 1000 )) ] && cpu_emerg=1
             [ "$dmax" -gt 0 ] && [ "$dmax" -ge "$DISK_EMERGENCY_TEMP" ] && disk_emerg=1
         fi
         if [ "$cpu_emerg" -eq 1 ] || [ "$disk_emerg" -eq 1 ]; then
