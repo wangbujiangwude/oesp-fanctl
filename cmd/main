@@ -23,6 +23,8 @@ is_running() {
 case "$1" in
     start)
         if is_running; then exit 0; fi
+        # 单例保护：清掉上一次可能残留的 Web 监控进程（避免累积多个实例）
+        pkill -f 'fanweb\.py' 2>/dev/null
         if [ ! -f "$OESP_FANCTL_CONF" ]; then
             cp "${TRIM_APPDEST}/oesp-fanctl.conf.default" "$OESP_FANCTL_CONF" 2>/dev/null
         fi
@@ -45,6 +47,8 @@ case "$1" in
         fi
         is_running && kill -9 "$(cat "$PID_FILE" | tr -d '[:space:]')" 2>/dev/null
         rm -f "$PID_FILE"
+        # 兜底清掉 Web 监控进程（守护进程被 -9 强杀时 EXIT trap 不会执行）
+        pkill -f 'fanweb\.py' 2>/dev/null
         # 释放 GPIO 并恢复系统自带风扇控制（避免停服后风扇失去温控）
         [ -x "$DAEMON" ] && "$DAEMON" restore >> "$OESP_FANCTL_LOG" 2>&1
         exit 0

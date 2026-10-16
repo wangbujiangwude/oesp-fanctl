@@ -49,6 +49,7 @@ LOG=${OESP_FANCTL_LOG:-/var/log/oesp-fanctl.log}
 STATE_FILE=${OESP_FANCTL_STATE:-/run/oesp-fanctl.state}
 HISTORY_FILE=${OESP_FANCTL_HISTORY:-/var/log/oesp-fanctl-history.csv}
 WEB_PORT=${WEB_PORT:-8765}
+WEB_SOCK=""             # Web 监控页网关 socket（由 resolve_paths 自动发现，用于 status 显示）
 
 # ---------- 默认配置（配置文件不存在时用；OESP 机型默认值） ----------
 FAN_MODE=auto           # 运行模式：auto=自动温控 / on=常开（一直运行） / off=常关（一直停）
@@ -98,6 +99,15 @@ resolve_paths() {
                  /var/apps/oesp-fanctl/var/history.csv; do
             [ -f "$c" ] && { HISTORY_FILE=$c; break; }
         done
+    fi
+    # Web 监控页的网关 socket（用于 status 里显示正确的访问方式）
+    if [ -z "${OESP_FANCTL_SOCK:-}" ]; then
+        for c in /vol1/@appcenter/oesp-fanctl/target/app.sock \
+                 /var/apps/oesp-fanctl/target/target/app.sock; do
+            [ -S "$c" ] && { WEB_SOCK=$c; break; }
+        done
+    else
+        WEB_SOCK="$OESP_FANCTL_SOCK"
     fi
 }
 
@@ -373,9 +383,16 @@ cmd_daemon() {
         OESP_FANCTL_CONF="$CONF" OESP_FANCTL_STATE="$STATE_FILE" OESP_FANCTL_HISTORY="$HISTORY_FILE" \
         WEB_PORT="$WEB_PORT" nohup python3 "$ws" >> "$LOG" 2>&1 &
         WEB_PID=$!
-        log "Web 监控页已启动: http://0.0.0.0:${WEB_PORT} (pid $WEB_PID)"
+        if [ -n "${OESP_FANCTL_SOCK:-}" ]; then
+            log "Web 监控页已启动: 飞牛桌面「OESP风扇助手」图标（网关 ${OESP_FANCTL_BASE:-/app/oesp-fanctl}，unix socket，pid $WEB_PID）"
+        else
+            log "Web 监控页已启动: http://0.0.0.0:${WEB_PORT} (pid $WEB_PID)"
+        fi
     }
     trap cleanup EXIT TERM INT
+    # 单例保护：清掉上一次残留的 fanweb 实例，避免重复监听同一个 socket
+    pkill -f 'fanweb\.py' 2>/dev/null
+    sleep 0.3
     start_web
 
     # --- 状态变量 ---
@@ -544,6 +561,7 @@ cmd_daemon() {
             echo "fan_target=$fan_state"
             echo "mode=$fan_mode"
             echo "backend=$FAN_BACKEND"
+            [ "$FAN_BACKEND" = "gpio" ] && echo "gpio_chip=$GPIO_CHIP" && echo "gpio_line=$GPIO_LINE"
             echo "disk_max=$dmax"
             echo "$DISK_TEMPS_OUT" | while IFS='=' read -r k v; do
                 [ -n "$k" ] && echo "disk_$k=$v"
@@ -606,7 +624,11 @@ cmd_status() {
     else
         echo "硬盘温度:  无温度源（可 modprobe drivetemp）"
     fi
-    echo "Web 监控:  http://NAS地址:${WEB_PORT}"
+    if [ -n "$WEB_SOCK" ] || [ -S "${OESP_FANCTL_SOCK:-/nonexistent}" ]; then
+        echo "Web 监控:  飞牛桌面点「OESP风扇助手」图标（网关 ${OESP_FANCTL_BASE:-/app/oesp-fanctl}）"
+    else
+        echo "Web 监控:  http://NAS地址:${WEB_PORT}"
+    fi
     case "$(normalize_mode "${FAN_MODE:-auto}")" in
         on)  echo "运行模式:  常开 —— 风扇持续运行，忽略温度判定" ;;
         off) echo "运行模式:  常关 —— 风扇持续停止，忽略温度判定" ;;
@@ -634,24 +656,37 @@ cmd_set() {
     resolve_paths
     [ -f "$CONF" ] || { echo "配置文件 $CONF 不存在，请先安装"; exit 1; }
     local key=$1 val=$2
+    local bak; bak=$(mktemp)
+    cp "$CONF" "$bak" 2>/dev/null
     case "$key" in
-        on)    [ "$val" -gt 0 ] 2>/dev/null || { echo "温度需为正整数"; exit 1; }
-               sed -i "s/^TEMP_ON=.*/TEMP_ON=$val/" "$CONF" ;;
-        off)   [ "$val" -gt 0 ] 2>/dev/null || { echo "温度需为正整数"; exit 1; }
-               sed -i "s/^TEMP_OFF=.*/TEMP_OFF=$val/" "$CONF" ;;
-        hdd)   [ "$val" -gt 0 ] 2>/dev/null || { echo "温度需为正整数"; exit 1; }
-               sed -i "s/^HDD_ON_TEMP=.*/HDD_ON_TEMP=$val/" "$CONF" ;;
+        on)    [ "$val" -gt 0 ] 2>/dev/null || { rm -f "$bak"; echo "温度需为正整数"; exit 1; }
+               sed -i "s/^TEMP_ON=[^[:space:]]*/TEMP_ON=$val/" "$CONF" ;;
+        off)   [ "$val" -gt 0 ] 2>/dev/null || { rm -f "$bak"; echo "温度需为正整数"; exit 1; }
+               sed -i "s/^TEMP_OFF=[^[:space:]]*/TEMP_OFF=$val/" "$CONF" ;;
+        hdd)   [ "$val" -gt 0 ] 2>/dev/null || { rm -f "$bak"; echo "温度需为正整数"; exit 1; }
+               sed -i "s/^HDD_ON_TEMP=[^[:space:]]*/HDD_ON_TEMP=$val/" "$CONF" ;;
         mode)  case "$val" in
                    auto|on|off) ;;
-                   *) echo "用法: oesp-fanctl set mode <auto|on|off>"; exit 1 ;;
+                   *) rm -f "$bak"; echo "用法: oesp-fanctl set mode <auto|on|off>"; exit 1 ;;
                esac
                if grep -q '^FAN_MODE=' "$CONF"; then
-                   sed -i "s/^FAN_MODE=.*/FAN_MODE=$val/" "$CONF"
+                   sed -i "s/^FAN_MODE=[^[:space:]]*/FAN_MODE=$val/" "$CONF"
                else
                    printf 'FAN_MODE=%s\n' "$val" >> "$CONF"
                fi ;;
-        *) echo "用法: oesp-fanctl set <on|off|hdd|mode> <值>"; exit 1 ;;
+        *) rm -f "$bak"; echo "用法: oesp-fanctl set <on|off|hdd|mode> <值>"; exit 1 ;;
     esac
+    # 交叉校验：CPU 开启温度必须高于关闭温度，否则回滚（与 Web 页规则一致）
+    local eon eoff
+    eon=$(grep -oE '^TEMP_ON=[0-9]+' "$CONF" 2>/dev/null | head -1 | cut -d= -f2)
+    eoff=$(grep -oE '^TEMP_OFF=[0-9]+' "$CONF" 2>/dev/null | head -1 | cut -d= -f2)
+    if [ -n "$eon" ] && [ -n "$eoff" ] && [ "$eon" -le "$eoff" ]; then
+        cp "$bak" "$CONF" 2>/dev/null
+        rm -f "$bak"
+        echo "错误：CPU 开启温度（${eon}℃）必须高于关闭温度（${eoff}℃），已取消本次修改"
+        exit 1
+    fi
+    rm -f "$bak"
     echo "已更新，守护进程 2 秒内自动生效："
     grep -E "^(FAN_MODE|TEMP_ON|TEMP_OFF|HDD_ON_TEMP)=" "$CONF"
 }

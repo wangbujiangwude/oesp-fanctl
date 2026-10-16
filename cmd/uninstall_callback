@@ -27,11 +27,15 @@ else
     done
 fi
 
-# 3. 按向导选择处理数据（wizard_data_action: keep | delete）
+# 3. 清理安装时创建的软链接
+rm -f /usr/local/bin/oesp-fanctl /usr/local/bin/fanlog 2>/dev/null
+
+# 4. 按向导选择处理数据（wizard_data_action: keep | delete）
 ACTION="${wizard_data_action:-keep}"
 if [ "$ACTION" = "delete" ]; then
     rm -f "${TRIM_PKGETC}/oesp-fanctl.conf" 2>/dev/null
     rm -f "${TRIM_PKGVAR}/oesp-fanctl.log" "${TRIM_PKGVAR}/oesp-fanctl.state" "${TRIM_PKGVAR}/history.csv" 2>/dev/null
+    rm -f "${TRIM_PKGVAR}/oesp-fanctl-history.csv" "${TRIM_PKGVAR}/oesp-fanctl.pid" 2>/dev/null
 fi
 
 exit 0

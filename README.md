@@ -5,7 +5,7 @@
 
 [![Platform](https://img.shields.io/badge/platform-arm64-blue)]()
 [![License](https://img.shields.io/badge/license-MIT-green)]()
-[![Version](https://img.shields.io/badge/version-1.9-orange)]()
+[![Version](https://img.shields.io/badge/version-1.15-orange)]()
 
 ---
 
@@ -69,8 +69,16 @@ OES Plus 刷飞牛 fnOS 之后，风扇控制有三个绕不过去的坑：
 - 📊 **硬件实时监控**
   CPU / GPU / 三个盘位硬盘（sda·sdb·sdc）温度一屏看完，12 小时历史曲线（每分钟采样一点）。
 
-- ⚙️ **在线调参**
-  网页内直接调整温度阈值，改完即时生效，无需命令行。
+- ⚙️ **在线调参（带服务端校验）**
+  网页内直接调整温度阈值与通风时长，改完即时生效，无需命令行。
+  提交时会校验「CPU 开启温度必须高于关闭温度」，写反了直接拒绝，不会留下反直觉配置。
+
+- ⌨️ **命令行工具（1.15 新增）**
+  安装时自动创建软链接，SSH 里直接可用：
+  - `oesp-fanctl status` 查看状态 · `mode on|off|auto` 切换模式 · `set TEMP_ON 40` 改阈值
+  - `fanlog` 实时温度监控，替代旧的 `tail -f /var/log/fan/fanctl.log`
+  - `set` 命令带**备份 + 交叉校验 + 回滚**：参数非法或阈值冲突时自动还原，不会写坏配置
+  - 改配置时保留行尾注释，不会把 `TEMP_ON=38  # CPU 高于此温度开风扇` 削成一行裸值
 
 - ↩️ **卸载可还原**
   提供 `restore` 流程：结束 `gpioset` → 重新加载 `gpio_fan` → 恢复厂商 60℃ 内核温控 → 重启 `pwm-fancontrol.service`。卸掉不留尾巴。
@@ -86,12 +94,12 @@ OES Plus 刷飞牛 fnOS 之后，风扇控制有三个绕不过去的坑：
 
 ### 方式一：应用中心（推荐）
 
-应用中心 → **手动安装** → 选择 `release/oesp-fanctl_1.14_arm.fpk`
+应用中心 → **手动安装** → 选择 `release/oesp-fanctl_1.15_arm.fpk`
 
 ### 方式二：命令行
 
 ```bash
-appcenter-cli install-fpk /path/to/oesp-fanctl_1.14_arm.fpk
+appcenter-cli install-fpk /path/to/oesp-fanctl_1.15_arm.fpk
 ```
 
 ### 安装后自动完成的事
@@ -101,6 +109,7 @@ appcenter-cli install-fpk /path/to/oesp-fanctl_1.14_arm.fpk
 3. 停用并禁用冲突服务，清理残留进程
 4. 启动温控守护进程，`gpioset` 常驻持有引脚
 5. 加载 `drivetemp` 模块（用于读取硬盘温度）
+6. 创建命令行软链接 `/usr/local/bin/oesp-fanctl`、`/usr/local/bin/fanlog`
 
 **无需任何手动配置，风扇即刻按温度自动启停。**
 
@@ -129,17 +138,21 @@ oesp-fanctl log
 ===== oesp-fanctl 状态 =====
 控制后端:  gpio 直控（gpiochip0 line 45）
 风扇状态:  开启  (0=关, 1=开)
+运行模式:  常开
 CPU 开启/关闭阈值:  38 / 35 ℃
 守护进程:  运行中
+Web 监控:  飞牛桌面点「OESP风扇助手」图标（网关 /app/oesp-fanctl）
 ```
 
 ### Web 监控页
+
+在飞牛桌面点「**OESP风扇助手**」图标即可打开，也可直接访问：
 
 ```
 http://<NAS地址>/app/oesp-fanctl
 ```
 
-含实时温度、风扇状态、12 小时历史曲线，以及在线调参面板。
+含实时温度、风扇状态、12 小时历史曲线，以及在线调参面板与运行模式切换。
 
 ### 手动测试
 
@@ -221,6 +234,8 @@ oesp-fanctl set mode on  # 等价写法
 | **冲突服务** | 只停 2 个 | 追加接管 `fanctl.service` |
 | **卸载恢复** | 仅重启 pwm-fancontrol | `restore`：还原厂商 60℃ 内核温控 |
 | **默认阈值** | 45/38 | 38/35（网页可调） |
+| **命令行** | 无 | 安装即建软链接：`oesp-fanctl` / `fanlog`（1.15） |
+| **配置校验** | 无 | Web 与 CLI 均做阈值交叉校验，写错自动拒绝 / 回滚（1.15） |
 
 ### 修复的 BUG 清单
 
@@ -237,8 +252,28 @@ oesp-fanctl set mode on  # 等价写法
 | 9 | **SSH 里执行 `set`/`mode` 报「配置文件不存在」** | 命令行执行时没有 appcenter 注入的 `OESP_FANCTL_CONF`，路径回落到 `/etc/oesp-fanctl.conf` | 新增 `resolve_paths()` 自动发现 conf/state/log/history |
 | 10 | **紧急保护退出瞬间风扇闪停一个周期** | 紧急标志一退，CPU 温控的防抖计数还没攒够 | 进入紧急保护时同步置位 CPU 温控路径 |
 | 11 | **Web 里点「常开 / 常关」后还要再点一次保存才生效** | 模式按钮只改前端高亮，必须靠表单提交 | 按钮改为点击即发 `POST /api/config`，只提交 `FAN_MODE`（不动温度阈值） |
+| 12 | **Web 能提交「开启温度低于关闭温度」的反直觉配置** | 服务端只校验字段类型，不做阈值交叉判断 | `POST /api/config` 合并「本次提交 + 现有配置」后校验，违反则 400 拒绝 |
+| 13 | **CLI `set` 无校验，且会把行尾注释删掉** | `sed 's/^TEMP_ON=.*/.../'` 通配吞掉注释，且无阈值交叉校验 | 加 `mktemp` 备份 + 校验 + 失败回滚；sed 改为 `s/^TEMP_ON=[^[:space:]]*/.../` 保留注释 |
+| 14 | **重启后残留多个 `fanweb.py` 进程** | 每次启动都 `nohup` 起新进程，旧的没清理（`-9` 强杀时 EXIT trap 不执行） | 守护进程与 `cmd/main` 的 start/stop 分支均先 `pkill -f fanweb\.py` 做单例保护 |
+| 15 | **`status` 显示 `http://NAS地址:8765`，但该端口并未监听** | Web 页实际经系统网关 unix socket 暴露，提示沿用旧端口写法 | `resolve_paths()` 探测 socket 存在性，改提示为「飞牛桌面点图标（网关 /app/oesp-fanctl）」 |
 
 ### 更新日志
+
+**1.15**
+- ✨ **新增命令行工具，安装时自动建软链接**
+  - `/usr/local/bin/oesp-fanctl`、`/usr/local/bin/fanlog` 装完即用，SSH 里不必再敲长路径
+  - 卸载钩子同步清理这两个软链接，不留残留
+- 🛡️ **配置写入全面加校验，写错不再生效**
+  - Web 端：`POST /api/config` 合并「本次提交 + 现有配置」后校验，`TEMP_ON <= TEMP_OFF` 直接 400 拒绝（此前只提交单字段也能绕过）
+  - 命令行：`oesp-fanctl set` 增加**备份 → 校验 → 失败回滚**，参数非整数 / 阈值冲突时自动还原原配置
+  - 修掉 `sed` 通配把行尾注释削掉的问题（`TEMP_ON=38  # 注释` 不再被吞）
+- 🐛 **修复重启后残留多个 `fanweb.py` 进程**
+  - 守护进程与 `cmd/main` 的 start / stop 分支均先做单例清理，避免重复监听同一个 socket
+- 🐛 **修复 `status` 里的 Web 地址误导**
+  - 旧提示恒显示 `http://NAS地址:8765`，但该端口并未监听（Web 页实际经系统网关 unix socket 暴露）
+  - 现改为「飞牛桌面点「OESP风扇助手」图标（网关 /app/oesp-fanctl）」
+- 📊 **状态输出补充「运行模式」与 Web 访问方式**；状态文件记录 GPIO 芯片与引脚号，供 `fanlog` 实读兜底
+- 📦 附：`tools/pack.py` 增加 `__pycache__` / `*.pyc` / 编辑器临时文件排除规则
 
 **1.14**
 - ✨ **Web「运行模式」改为点击即生效**（无需再点保存按钮）
@@ -316,7 +351,7 @@ oesp-fanctl set mode on  # 等价写法
 │   ├── 推文-微信公众号.md
 │   └── 推文-飞牛论坛.md
 └── release/
-    └── oesp-fanctl_1.14_arm.fpk
+    └── oesp-fanctl_1.15_arm.fpk
 ```
 
 ---
@@ -343,7 +378,7 @@ MD5=$(md5sum app.tgz | cut -d' ' -f1)
 sed -i "s/^checksum.*/checksum              = $MD5/" manifest
 
 # 3) 打包 FPK
-tar -czf oesp-fanctl_1.14_arm.fpk app.tgz LICENSE cmd config ICON.PNG ICON_256.PNG manifest wizard
+tar -czf oesp-fanctl_1.15_arm.fpk app.tgz LICENSE cmd config ICON.PNG ICON_256.PNG manifest wizard
 ```
 
 **要点**：
@@ -367,6 +402,16 @@ tar -czf oesp-fanctl_1.14_arm.fpk app.tgz LICENSE cmd config ICON.PNG ICON_256.P
 **Q：为什么默认阈值是 38/35？**
 
 偏保守设置（风扇基本常开）。想要安静建议改成 `45/38` 或 `60/55`。
+
+**Q：怎么用命令行改阈值？**
+
+```bash
+oesp-fanctl set on 40     # CPU 开启温度改成 40℃
+oesp-fanctl set off 36    # CPU 关闭温度改成 36℃
+oesp-fanctl mode auto     # 切回自动温控
+```
+
+参数非法或「开启温度不高于关闭温度」时会被拒绝并自动回滚，原配置不受影响。
 
 **Q：`tail -f /var/log/fan/fanctl.log` 没输出了？**
 

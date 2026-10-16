@@ -14,13 +14,16 @@
 # ============================================================
 set -u
 
-STATE=/var/apps/oesp-fanctl/var/oesp-fanctl.state
 CPU_NODE=/sys/class/thermal/thermal_zone0/temp
 GPU_NODE=/sys/class/thermal/thermal_zone1/temp
-DISK_NODE=/sys/class/hwmon/hwmon2/temp1_input
 OLD_LOG=/var/log/fan/fanctl.log
-CHIP=gpiochip0
-LINE=45
+
+# 路径自动发现：兼容 appcenter 注入的 /var/apps/<app>/ 视图与真实卷路径
+find_first() { local p; for p in "$@"; do [ -e "$p" ] && { printf '%s' "$p"; return; }; done; printf '%s' "$1"; }
+STATE=$(find_first /var/apps/oesp-fanctl/var/oesp-fanctl.state \
+                   /vol1/@appdata/oesp-fanctl/oesp-fanctl.state)
+CONF=$(find_first  /var/apps/oesp-fanctl/etc/oesp-fanctl.conf \
+                   /vol1/@appconf/oesp-fanctl/oesp-fanctl.conf)
 
 usage() {
     sed -n '3,15p' "$0" | sed 's/^# \{0,1\}//'
@@ -36,21 +39,22 @@ fmt_t() {
     printf '%d.%d' $((v / 1000)) $(((v % 1000) / 100))
 }
 
-# 风扇状态：优先读 state 文件，其次 gpioget
+# 从 state 文件取某个 key 的值
+sv() { grep -o "$1=[^[:space:]]*" "$STATE" 2>/dev/null | head -1 | cut -d= -f2; }
+
+# 风扇状态：优先读 state 文件（守护进程自己写的，最准），其次实读 GPIO 电平
 fan_state() {
     local v
-    v=$(grep -o 'fan_state=[0-9]*' "$STATE" 2>/dev/null | head -1 | cut -d= -f2)
+    v=$(sv fan_state)
     if [ -z "$v" ]; then
-        v=$(gpioget "$CHIP" "$LINE" 2>/dev/null | tr -dc '0-9' | head -c1)
+        v=$(gpioget "$(sv gpio_chip || echo gpiochip0)" "$(sv gpio_line || echo 45)" 2>/dev/null | tr -dc '0-9' | head -c1)
     fi
     printf '%s' "${v:-?}"
 }
 
 # 运行模式：auto / on / off
 fan_mode() {
-    local v
-    v=$(grep -o 'mode=[a-z]*' "$STATE" 2>/dev/null | head -1 | cut -d= -f2)
-    case "$v" in
+    case "$(sv mode)" in
         on)  printf '常开' ;;
         off) printf '常关' ;;
         auto) printf '自动' ;;
@@ -58,12 +62,18 @@ fan_mode() {
     esac
 }
 
+# 硬盘最高温（state 里由守护进程写入）
+disk_t() {
+    local v; v=$(sv disk_max)
+    printf '%s' "${v:-?}"
+}
+
 line() {
     printf '[%s] 温度=%s℃ GPU=%s℃ 硬盘=%s℃ 风扇=%s 模式=%s\n' \
         "$(date '+%F %T')" \
         "$(fmt_t "$CPU_NODE")" \
         "$(fmt_t "$GPU_NODE")" \
-        "$(fmt_t "$DISK_NODE")" \
+        "$(disk_t)" \
         "$(fan_state)" \
         "$(fan_mode)"
 }
@@ -81,8 +91,9 @@ case "${1:-}" in
     *)
         iv="${1:-3}"
         echo "OESP 风扇实时监控（间隔 ${iv}s，Ctrl+C 退出）"
+        echo "数据来源: $STATE"
         echo "运行模式: $(fan_mode)（auto=自动温控 / on=常开 / off=常关）"
-        echo "CPU开启/关闭阈值: $(grep -oE '^TEMP_(ON|OFF)=[0-9]+' /vol1/@appconf/oesp-fanctl/oesp-fanctl.conf 2>/dev/null | tr '\n' ' ')"
+        echo "CPU开启/关闭阈值: $(grep -oE '^TEMP_(ON|OFF)=[0-9]+' "$CONF" 2>/dev/null | tr '\n' ' ')"
         while :; do
             line
             sleep "$iv"

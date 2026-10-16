@@ -316,6 +316,7 @@ const MODE_HINT = {
 let visible = { cpu:true, gpu:true, d1:true, d2:true, d3:true };
 let historyData = null;
 let diskLabels = [];
+let lastDiskKey = '';
 let lastCardsKey = '';
 
 const BLADE = 'M24 24c-2-8 1.5-14 8-15c1 6.5-2 12-8 15z';
@@ -424,6 +425,9 @@ async function refreshState(){
     if (s.fan_state === 1) { b.className = 'pill on'; document.getElementById('fanbadgeTxt').textContent = '风扇运行中'; }
     else { b.className = 'pill'; document.getElementById('fanbadgeTxt').textContent = '风扇已停止'; }
     diskLabels = s.disks.map(d => d.name);
+    // 硬盘列表变化时重绘：图例要按实际盘位显示，否则首次加载只会有 CPU/GPU 两个图例
+    const dk = diskLabels.join(',');
+    if (dk !== lastDiskKey) { lastDiskKey = dk; if (historyData) drawChart(); }
     const samples = historyData ? historyData.cpu.length : 0;
     const key = JSON.stringify([s.cpu, s.gpu, s.disks, s.fan_state, s.fan_target, s.mode, samples]);
     if (key !== lastCardsKey) {
@@ -705,6 +709,18 @@ class Handler(BaseHTTPRequestHandler):
         if not updates:
             self._json({"ok": False, "error": "没有可更新的字段"}, 400)
             return
+        # 阈值交叉校验：合并「本次提交 + 现有配置」后判断，避免只改一个字段时漏检
+        if "TEMP_ON" in updates or "TEMP_OFF" in updates:
+            cur = read_kv_file(CONF)
+            try:
+                eff_on = int(updates.get("TEMP_ON", cur.get("TEMP_ON", 0)))
+                eff_off = int(updates.get("TEMP_OFF", cur.get("TEMP_OFF", 0)))
+            except (TypeError, ValueError):
+                self._json({"ok": False, "error": "温度阈值必须是整数"}, 400)
+                return
+            if eff_on <= eff_off:
+                self._json({"ok": False, "error": "CPU 开启温度必须高于关闭温度（当前提交后为 %d / %d）" % (eff_on, eff_off)}, 400)
+                return
         ok, msg = write_conf(updates)
         self._json({"ok": ok, "error": None if ok else msg},
                    200 if ok else 500)

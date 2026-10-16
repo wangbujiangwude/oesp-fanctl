@@ -28,7 +28,7 @@ MANIFEST = os.path.join(ROOT, "manifest")
 APP_TGZ = os.path.join(ROOT, "app.tgz")
 
 EXEC = {
-    "oesp-fanctl", "fanweb.py",
+    "oesp-fanctl", "fanweb.py", "fanlog",
     "cmd/main", "cmd/install_callback", "cmd/uninstall_callback",
     "cmd/upgrade_callback", "cmd/config_callback", "cmd/config_init",
     "cmd/install_init", "cmd/uninstall_init", "cmd/upgrade_init",
@@ -42,17 +42,34 @@ def mode_for(rel, isdir):
     return 0o755 if rel.replace("\\", "/") in EXEC else 0o644
 
 
+EXCLUDE_DIRS = {"__pycache__", ".git", ".idea", ".vscode"}
+EXCLUDE_EXT = {".pyc", ".pyo", ".tmp", ".bak", ".swp", ".orig"}
+
+
+def _skip(rel):
+    parts = rel.replace("\\", "/").split("/")
+    if any(p in EXCLUDE_DIRS for p in parts):
+        return True
+    if os.path.splitext(parts[-1])[1].lower() in EXCLUDE_EXT:
+        return True
+    return parts[-1].startswith(".")
+
+
 def add_tree(tf, base, prefix=""):
     """把 base 目录下的内容按排序加入 tar（相对路径，无前导 ./）"""
     entries = []
     for root, dirs, files in os.walk(base):
-        dirs.sort()
+        dirs[:] = sorted(d for d in dirs if d not in EXCLUDE_DIRS)
         for d in dirs:
             full = os.path.join(root, d)
-            entries.append((os.path.relpath(full, base), True))
+            rel = os.path.relpath(full, base)
+            if not _skip(rel):
+                entries.append((rel, True))
         for f in sorted(files):
             full = os.path.join(root, f)
-            entries.append((os.path.relpath(full, base), False))
+            rel = os.path.relpath(full, base)
+            if not _skip(rel):
+                entries.append((rel, False))
     entries.sort(key=lambda x: (x[0].count(os.sep), x[0]))
     for rel, isdir in entries:
         name = os.path.join(prefix, rel) if prefix else rel

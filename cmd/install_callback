@@ -59,4 +59,16 @@ if ! command -v python3 >/dev/null 2>&1; then
         || err_log "python3 安装失败，Web 监控页将不可用；风扇温控功能不受影响。可稍后手动执行 apt install python3 后重启本应用。"
 fi
 
+# 6. 装两个方便命令行使用的软链接（新用户不必记完整路径）
+#    oesp-fanctl  → 状态 / 调参 / 切模式
+#    fanlog       → 实时温度监控（替代旧的 tail -f /var/log/fan/fanctl.log）
+for pair in "oesp-fanctl:oesp-fanctl" "fanlog:fanlog"; do
+    name="${pair%%:*}"; src="${pair##*:}"
+    if [ -f "${TRIM_APPDEST}/$src" ]; then
+        ln -sf "${TRIM_APPDEST}/$src" "/usr/local/bin/$name" 2>/dev/null \
+            && chmod 755 "/usr/local/bin/$name" 2>/dev/null
+    fi
+done
+err_log "已创建命令软链接: /usr/local/bin/oesp-fanctl, /usr/local/bin/fanlog"
+
 exit 0
