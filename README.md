@@ -348,6 +348,7 @@ oesp-fanctl set mode on  # 等价写法
 │   ├── fanlog                # 实时温度监控命令
 │   └── pack.py               # 一键打包脚本（重建 app.tgz → 回写 checksum → 产出 .fpk）
 ├── docs/
+│   ├── images/               # 推文配图（封面 / 能力总览 / 模式 / 监控页 / 命令行）
 │   ├── 推文-微信公众号.md
 │   └── 推文-飞牛论坛.md
 └── release/
