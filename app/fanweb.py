@@ -6,7 +6,8 @@ OESP风扇助手 - Web 监控页（零依赖，仅标准库）
   GET  /             监控面板（CPU/GPU/硬盘温度曲线，12H）
   GET  /api/state    实时状态 JSON
   GET  /api/history  12H 历史曲线 JSON
-  POST /api/config   修改温度阈值 {"TEMP_ON":45,...}
+  POST /api/config   修改温度阈值与运行模式 {"TEMP_ON":45,"FAN_MODE":"on"}
+                     FAN_MODE: auto=自动温控 / on=常开(一直运行) / off=常关
 """
 import json
 import os
@@ -28,6 +29,10 @@ EDITABLE = {
     "TEMP_ON": (20, 90), "TEMP_OFF": (10, 85),
     "HDD_ON_TEMP": (30, 70),
     "HDD_RUN_SECONDS": (30, 1800),
+}
+# 字符串型配置：FAN_MODE = auto(自动温控) / on(常开，一直运行) / off(常关)
+EDITABLE_STR = {
+    "FAN_MODE": ("auto", "on", "off"),
 }
 
 
@@ -74,6 +79,7 @@ def read_state():
         "disks": disks,
         "fan_state": toint("fan_state", 0),
         "fan_target": toint("fan_target", 0),
+        "mode": st.get("mode", "auto"),
         "ts": toint("ts", 0),
     }
 
@@ -225,6 +231,15 @@ form{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end}
 .field input{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:#f8fafc;
       color:var(--txt);font-size:15px;outline:none;transition:.2s;font-variant-numeric:tabular-nums}
 .field input:focus{border-color:var(--cyan);box-shadow:0 0 0 3px rgba(8,145,178,.12),0 0 12px rgba(8,145,178,.18)}
+/* 运行模式分段选择器 */
+.seg{display:flex;gap:6px;background:rgba(15,30,60,.05);padding:4px;border-radius:12px;border:1px solid var(--line)}
+.seg button{flex:1;padding:9px 10px;border:0;border-radius:9px;background:transparent;color:var(--txt2);
+      font-size:13px;font-weight:600;cursor:pointer;transition:.18s;font-family:inherit;white-space:nowrap}
+.seg button:hover{color:var(--cyan)}
+.seg button.act{background:linear-gradient(135deg,var(--cyan),var(--blue));color:#03121c;
+      box-shadow:0 3px 14px rgba(56,190,255,.35)}
+.seg button.act.hot{background:linear-gradient(135deg,#f59e0b,#dc2626);color:#fff;
+      box-shadow:0 3px 14px rgba(220,38,38,.35)}
 .save{flex:none;margin-left:auto;padding:11px 26px;border:0;border-radius:12px;font-size:14px;
       font-weight:700;color:#03121c;background:linear-gradient(135deg,var(--cyan),var(--blue));cursor:pointer;
       box-shadow:0 4px 20px rgba(56,190,255,.35);transition:.2s}
@@ -263,6 +278,15 @@ form{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end}
   <div class="panel">
     <h2><span class="bar"></span>温控阈值设置</h2>
     <form id="cfgform" onsubmit="return saveCfg(event)">
+      <div class="field" style="flex:1 1 100%;margin-bottom:14px">
+        <label>风扇运行模式</label>
+        <div class="seg" id="modeseg">
+          <button type="button" data-mode="auto">自动温控</button>
+          <button type="button" data-mode="on">常开 · 一直运行</button>
+          <button type="button" data-mode="off">常关 · 一直停止</button>
+        </div>
+        <div style="font-size:12px;color:var(--txt3);margin-top:7px" id="modehint"></div>
+      </div>
       <div class="field"><label>CPU 开启温度（℃）</label><input id="TEMP_ON" type="number" min="20" max="90"></div>
       <div class="field"><label>CPU 关闭温度（℃）</label><input id="TEMP_OFF" type="number" min="10" max="85"></div>
       <div class="field"><label>硬盘开启温度（℃）</label><input id="HDD_ON_TEMP" type="number" min="30" max="70"></div>
@@ -276,6 +300,13 @@ form{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end}
 <script>
 const COLORS = { cpu:'#2563eb', gpu:'#9333ea', d1:'#059669', d2:'#d97706', d3:'#db2777' };
 const NAMES  = { cpu:'CPU', gpu:'GPU', d1:'硬盘1', d2:'硬盘2', d3:'硬盘3' };
+const MODE_TXT = { auto:'自动温控', on:'常开 · 一直运行', off:'常关 · 一直停止' };
+const MODE_HINT = {
+  auto:'按 CPU / 硬盘温度自动启停（阈值见下方），过热紧急保护生效',
+  on:'风扇将持续全速运行，忽略温度判定；适合夏季高温或硬盘密集场景',
+  off:'风扇将持续停止，忽略温度判定；注意：此模式下过热紧急保护也不会触发，请留意散热风险'
+};
+let curMode = 'auto';
 let visible = { cpu:true, gpu:true, d1:true, d2:true, d3:true };
 let historyData = null;
 let diskLabels = [];
@@ -324,8 +355,11 @@ function tempCard(name, t, icon){
       ${ringSvg(t)}
     </div></div>`;
 }
-function fanCard(on){
+function fanCard(on, mode){
   const spd = on ? '0.6s' : '1s';
+  const mtag = mode === 'on' ? '<span style="color:#dc2626;font-weight:700">常开</span>'
+             : mode === 'off' ? '<span style="color:#64748b;font-weight:700">常关</span>'
+             : '<span style="color:#0891b2;font-weight:700">自动</span>';
   return `<div class="card">
     <div class="c-head"><span class="c-name">风扇状态</span>
       <svg class="c-ico" viewBox="0 0 24 24" fill="none" stroke="${on ? '#059669' : '#94a3b8'}" stroke-width="1.6" stroke-linecap="round"><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1"/></svg></div>
@@ -336,7 +370,8 @@ function fanCard(on){
         <circle cx="24" cy="24" r="3.2" fill="#ffffff" stroke="#0ea5e9" stroke-width="1.5"/>
       </svg>
       <div><div class="lbl">当前状态</div>
-      <div class="big" style="color:${on ? '#059669' : '#94a3b8'}">${on ? '运行中' : '已停止'}</div></div>
+      <div class="big" style="color:${on ? '#059669' : '#94a3b8'}">${on ? '运行中' : '已停止'}</div>
+      <div class="lbl" style="margin-top:7px">模式 ${mtag}</div></div>
     </div></div>`;
 }
 function diskCards(disks){
@@ -384,12 +419,12 @@ async function refreshState(){
     else { b.className = 'pill'; document.getElementById('fanbadgeTxt').textContent = '风扇已停止'; }
     diskLabels = s.disks.map(d => d.name);
     const samples = historyData ? historyData.cpu.length : 0;
-    const key = JSON.stringify([s.cpu, s.gpu, s.disks, s.fan_state, s.fan_target, samples]);
+    const key = JSON.stringify([s.cpu, s.gpu, s.disks, s.fan_state, s.fan_target, s.mode, samples]);
     if (key !== lastCardsKey) {
       lastCardsKey = key;
       document.getElementById('cards').innerHTML =
         clockCard(samples) +
-        fanCard(s.fan_state === 1) +
+        fanCard(s.fan_state === 1, s.mode) +
         tempCard('CPU', s.cpu, ICO.chip) +
         tempCard('GPU', s.gpu, ICO.gpu) +
         diskCards(s.disks);
@@ -400,6 +435,7 @@ async function refreshState(){
         const el = document.getElementById(k);
         if (el && s.conf[k] !== undefined) el.value = s.conf[k];
       }
+      if (s.conf.FAN_MODE) { curMode = s.conf.FAN_MODE; paintMode(); }
     }
   } catch(e) {}
 }
@@ -497,10 +533,25 @@ function renderLegend(){
   }
 }
 
+/* ---------- 运行模式 ---------- */
+function paintMode(){
+  document.querySelectorAll('#modeseg button').forEach(b => {
+    const on = b.dataset.mode === curMode;
+    b.classList.toggle('act', on);
+    b.classList.toggle('hot', on && curMode !== 'auto');
+  });
+  const h = document.getElementById('modehint');
+  if (h) h.textContent = MODE_HINT[curMode] || '';
+}
+document.querySelectorAll('#modeseg button').forEach(b => {
+  b.onclick = () => { curMode = b.dataset.mode; paintMode(); };
+});
+paintMode();
+
 /* ---------- 保存配置 ---------- */
 async function saveCfg(ev){
   ev.preventDefault();
-  const body = {};
+  const body = { FAN_MODE: curMode };
   for (const k of ['TEMP_ON', 'TEMP_OFF', 'HDD_ON_TEMP', 'HDD_RUN_SECONDS'])
     body[k] = parseInt(document.getElementById(k).value, 10);
   const msg = document.getElementById('msg');
@@ -562,6 +613,7 @@ class Handler(BaseHTTPRequestHandler):
             st = read_state()
             conf = read_kv_file(CONF)
             st["conf"] = {k: conf.get(k) for k in EDITABLE if k in conf}
+            st["conf"].update({k: conf.get(k) for k in EDITABLE_STR if k in conf})
             st["server_time"] = int(time.time())
             self._json(st)
         elif path == "/api/history":
@@ -596,6 +648,13 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 if not (lo <= v <= hi):
                     self._json({"ok": False, "error": "%s 超出范围 %d-%d" % (k, lo, hi)}, 400)
+                    return
+                updates[k] = v
+        for k, allowed in EDITABLE_STR.items():
+            if k in data:
+                v = str(data[k]).strip().lower()
+                if v not in allowed:
+                    self._json({"ok": False, "error": "%s 只能是 %s" % (k, "/".join(allowed))}, 400)
                     return
                 updates[k] = v
         if not updates:

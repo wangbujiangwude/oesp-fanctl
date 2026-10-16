@@ -1,6 +1,11 @@
 # oesp-fanctl 配置文件（OESP / OES Plus 机型）
 # 修改后无需重启服务，守护进程 2 秒内自动读取生效
 
+# 运行模式：auto = 自动温控（按下面阈值启停）
+#           on   = 常开，风扇一直运行，忽略所有温度判定（夏季高温 / 硬盘密集 / 求稳）
+#           off  = 常关，风扇一直停止，忽略所有温度判定（夜间静音）
+# 也可用命令切换：oesp-fanctl mode on   /   oesp-fanctl mode auto
+FAN_MODE=auto
 TEMP_ON=38              # CPU 高于此温度开风扇（℃）
 TEMP_OFF=35             # CPU 低于此温度关风扇（℃）
 HDD_ON_TEMP=50          # 任一硬盘达到此温度启动定时通风（℃）

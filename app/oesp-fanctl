@@ -17,6 +17,13 @@
 #     （仅在该机型无 gpio 直控能力时使用，可靠性受内核调控器影响）。
 #
 #  策略特性：
+#   · 运行模式 FAN_MODE（2026-10-16 新增）：
+#       auto = 自动温控（默认，按 CPU / 硬盘温度启停）
+#       on   = 常开：风扇一直运行，完全忽略温度判定（适合夏季高温 / 硬盘密集 / 求稳）
+#       off  = 常关：风扇一直停止，完全忽略温度判定（适合夜间静音）
+#     运行时可切换，守护进程 2 秒内生效：oesp-fanctl set mode on
+#     ⚠ 注意：on / off 为强制覆盖模式，会同时忽略「过热紧急保护」。
+#        off 模式下即使 CPU 超过 EMERGENCY_TEMP 也不会开风扇，请留意散热风险。
 #   · CPU 迟滞温控：>=TEMP_ON 开，<=TEMP_OFF 关（带连续计数防抖 + 最短运行时间）
 #   · 硬盘定时通风：任一盘 >=HDD_ON_TEMP 开，运行 HDD_RUN_SECONDS 后停机 HDD_COOLDOWN 秒，
 #     间歇结束仍超温则开新一轮，降温则保持关
@@ -30,6 +37,8 @@
 #   oesp-fanctl set on 38       设置 CPU 开启温度
 #   oesp-fanctl set off 35      设置 CPU 关闭温度
 #   oesp-fanctl set hdd 50      设置硬盘定时通风开启温度
+#   oesp-fanctl set mode on     设置运行模式（auto=自动温控 / on=常开 / off=常关）
+#   oesp-fanctl mode on         同上，简写
 #   oesp-fanctl test on|off     手动开/关风扇测试（一次性，会短暂抢占控制权）
 #   oesp-fanctl restore         释放 GPIO 并恢复系统自带风扇控制（卸载/停用前调用）
 #   oesp-fanctl log             查看运行日志
@@ -42,6 +51,7 @@ HISTORY_FILE=${OESP_FANCTL_HISTORY:-/var/log/oesp-fanctl-history.csv}
 WEB_PORT=${WEB_PORT:-8765}
 
 # ---------- 默认配置（配置文件不存在时用；OESP 机型默认值） ----------
+FAN_MODE=auto           # 运行模式：auto=自动温控 / on=常开（一直运行） / off=常关（一直停）
 TEMP_ON=38              # CPU 高于此温度开风扇（℃）—— 沿用用户原 fanctl.sh 设置
 TEMP_OFF=35             # CPU 低于此温度关风扇（℃）—— 沿用用户原 fanctl.sh 设置
 HDD_ON_TEMP=50          # 任一硬盘达到此温度启动定时通风（℃）
@@ -55,7 +65,52 @@ MIN_RUN=60              # CPU 温控风扇最短运行时间（秒）
 DISK_CHECK_CYCLES=10    # 每 N 个周期读一次硬盘温度（smartctl 开销大）
 
 load_conf() {
+    resolve_paths
     [ -f "$CONF" ] && . "$CONF"
+}
+
+# ---------- 路径自动发现 ----------
+# 由应用中心启动时，环境变量 OESP_FANCTL_CONF/STATE/LOG/HISTORY 已由 appcenter 注入；
+# 但用户直接在 SSH 里执行 oesp-fanctl（status / set / mode / log）时并没有这些变量，
+# 会回落到 /etc/oesp-fanctl.conf 等不存在的默认路径 → 命令报「配置文件不存在」。
+# 这里按实际安装位置自动补齐（仅在对应环境变量未设置时生效，不影响守护进程）。
+resolve_paths() {
+    local c
+    if [ -z "${OESP_FANCTL_CONF:-}" ]; then
+        for c in /vol1/@appconf/oesp-fanctl/oesp-fanctl.conf /etc/oesp-fanctl.conf; do
+            [ -f "$c" ] && { CONF=$c; break; }
+        done
+    fi
+    if [ -z "${OESP_FANCTL_STATE:-}" ]; then
+        for c in /vol1/@appdata/oesp-fanctl/oesp-fanctl.state \
+                 /var/apps/oesp-fanctl/var/oesp-fanctl.state /run/oesp-fanctl.state; do
+            [ -f "$c" ] && { STATE_FILE=$c; break; }
+        done
+    fi
+    if [ -z "${OESP_FANCTL_LOG:-}" ]; then
+        for c in /vol1/@appdata/oesp-fanctl/oesp-fanctl.log \
+                 /var/apps/oesp-fanctl/var/oesp-fanctl.log; do
+            [ -f "$c" ] && { LOG=$c; break; }
+        done
+    fi
+    if [ -z "${OESP_FANCTL_HISTORY:-}" ]; then
+        for c in /vol1/@appdata/oesp-fanctl/history.csv \
+                 /var/apps/oesp-fanctl/var/history.csv; do
+            [ -f "$c" ] && { HISTORY_FILE=$c; break; }
+        done
+    fi
+}
+
+# 归一化运行模式 → 只输出 auto / on / off
+normalize_mode() {
+    case "${1:-auto}" in
+        auto|AUTO|Auto|"")                                              echo auto ;;
+        on|ON|On|always|always_on|always-on|force_on|force-on|open|1|yes|true)
+                                                                       echo on ;;
+        off|OFF|Off|always_off|always-off|force_off|force-off|close|stop|0|no|false)
+                                                                       echo off ;;
+        *)                                                              echo auto ;;
+    esac
 }
 
 # ============================================================
@@ -149,7 +204,9 @@ read_fan() {
             # 独立进程（如 oesp-fanctl status）：变量为空，
             # 从 state 文件读守护进程上报的实际状态（引脚被 gpioset 持有，gpioget 会 EBUSY）
             local v="" sf
-            for sf in "$STATE_FILE" /vol1/@appdata/oesp-fanctl/oesp-fanctl.state /run/oesp-fanctl.state; do
+            resolve_paths
+            for sf in "$STATE_FILE" /vol1/@appdata/oesp-fanctl/oesp-fanctl.state \
+                      /var/apps/oesp-fanctl/var/oesp-fanctl.state /run/oesp-fanctl.state; do
                 [ -f "$sf" ] || continue
                 v=$(grep -o 'fan_state=[0-9]*' "$sf" 2>/dev/null | head -1 | cut -d= -f2)
                 [ -n "$v" ] && break
@@ -331,6 +388,7 @@ cmd_daemon() {
     local fan_state=0
     local cycle=0
     local dmax=0
+    local cur_mode=""        # 已生效的运行模式（用于模式切换时只打一次日志）
 
     detect_disks
     if [ "${#DISK_SOURCES[@]}" -gt 0 ]; then
@@ -339,8 +397,15 @@ cmd_daemon() {
         log "未找到硬盘温度源（可执行 modprobe drivetemp 后重启本服务），仅按 CPU 温度控制"
     fi
 
-    # 初始释放：先关风扇，交由主循环按温度决策
-    set_fan 0
+    # 初始状态：常开模式立即开启（避免启动瞬间的关→开抖动），否则先关由主循环决策
+    if [ "$(normalize_mode "${FAN_MODE:-auto}")" = "on" ]; then
+        set_fan 1
+        fan_state=1
+        cur_mode=on
+        log "启动：运行模式为「常开」，风扇立即运行"
+    else
+        set_fan 0
+    fi
 
     while true; do
         load_conf
@@ -364,6 +429,29 @@ cmd_daemon() {
         fi
         dmax=$DISK_MAX_TEMP
         local gpu_f=$(get_gpu_temp)
+
+        # --- 运行模式（auto=自动温控 / on=常开 / off=常关）---
+        local fan_mode=$(normalize_mode "${FAN_MODE:-auto}")
+        if [ "$fan_mode" != "$cur_mode" ]; then
+            case "$fan_mode" in
+                on)  log "运行模式 → 常开：风扇持续运行，忽略温度判定" ;;
+                off) log "运行模式 → 常关：风扇持续停止，忽略温度判定" ;;
+                *)   log "运行模式 → 自动温控：按 CPU / 硬盘温度启停" ;;
+            esac
+            cur_mode=$fan_mode
+        fi
+        # -1 = 不覆盖（自动温控）；0 = 强制关；1 = 强制开
+        local mode_override=-1
+        [ "$fan_mode" = "on" ]  && mode_override=1
+        [ "$fan_mode" = "off" ] && mode_override=0
+
+        if [ "$mode_override" -ge 0 ]; then
+            # 常开 / 常关：完全跳过温度判定，并清零内部计数，
+            # 避免切回 auto 时残留的 high_count / 计时器造成误动作
+            cpu_fan=0; cpu_fan_start=0; high_count=0; emergency=0
+            local hdd_want_on=0
+            hdd_run_until=0; hdd_cool_until=0
+        else
 
         # --- CPU 温控（迟滞 + 最短运行）---
         local cpu_hot=0 cpu_cold=1
@@ -402,6 +490,9 @@ cmd_daemon() {
                 log "!! 过热 CPU ${temp_f}℃ / 硬盘 ${dmax}℃，强制开启风扇"
             fi
             emergency=1
+            # 同时把 CPU 温控路径置位：否则紧急保护退出（迟滞 5℃）的瞬间，
+            # 若防抖计数 STABLE_COUNT 还没攒够，want_on 会掉回 0 而让风扇闪停一个周期。
+            cpu_fan=1; cpu_fan_start=${cpu_fan_start:-$now}; high_count=$STABLE_COUNT
         else
             emergency=0
         fi
@@ -421,14 +512,22 @@ cmd_daemon() {
             hdd_want_on=0
         fi
 
-        # --- 综合判定（二态）：任一来源要求开即开 ---
+        fi  # 结束「自动温控」分支
+
+        # --- 综合判定（二态）：常开/常关直接覆盖；否则任一来源要求开即开 ---
         local want_on=0
-        [ "$cpu_fan" -eq 1 ] && want_on=1
-        [ "$hdd_want_on" -eq 1 ] && want_on=1
-        [ "$emergency" -eq 1 ] && want_on=1
+        if [ "$mode_override" -ge 0 ]; then
+            want_on=$mode_override
+        else
+            [ "$cpu_fan" -eq 1 ] && want_on=1
+            [ "$hdd_want_on" -eq 1 ] && want_on=1
+            [ "$emergency" -eq 1 ] && want_on=1
+        fi
         if [ "$want_on" -ne "$fan_state" ]; then
             fan_state=$want_on
-            if [ "$fan_state" -eq 1 ]; then
+            if [ "$mode_override" -ge 0 ]; then
+                [ "$fan_state" -eq 1 ] && log "风扇 → 开启（常开模式）" || log "风扇 → 关闭（常关模式）"
+            elif [ "$fan_state" -eq 1 ]; then
                 log "风扇 → 开启（CPU温控=${cpu_fan} 硬盘通风=${hdd_want_on} 紧急=${emergency}）"
             else
                 log "风扇 → 关闭"
@@ -443,6 +542,7 @@ cmd_daemon() {
             echo "gpu=$gpu_f"
             echo "fan_state=$fan_state"
             echo "fan_target=$fan_state"
+            echo "mode=$fan_mode"
             echo "backend=$FAN_BACKEND"
             echo "disk_max=$dmax"
             echo "$DISK_TEMPS_OUT" | while IFS='=' read -r k v; do
@@ -507,6 +607,11 @@ cmd_status() {
         echo "硬盘温度:  无温度源（可 modprobe drivetemp）"
     fi
     echo "Web 监控:  http://NAS地址:${WEB_PORT}"
+    case "$(normalize_mode "${FAN_MODE:-auto}")" in
+        on)  echo "运行模式:  常开 —— 风扇持续运行，忽略温度判定" ;;
+        off) echo "运行模式:  常关 —— 风扇持续停止，忽略温度判定" ;;
+        *)   echo "运行模式:  自动温控（按温度启停）" ;;
+    esac
     echo "CPU 开启/关闭阈值:  ${TEMP_ON} / ${TEMP_OFF} ℃"
     echo "硬盘定时通风阈值:  ${HDD_ON_TEMP} ℃（触发后运行 ${HDD_RUN_SECONDS}s，停机间歇 ${HDD_COOLDOWN}s）"
     echo "紧急强制开启:  CPU ${EMERGENCY_TEMP} ℃ / 硬盘 ${DISK_EMERGENCY_TEMP} ℃（兜底保护）"
@@ -526,6 +631,7 @@ cmd_status() {
 # ---------- 修改配置 ----------
 cmd_set() {
     [ "$(id -u)" -ne 0 ] && exec sudo "$0" set "$@"
+    resolve_paths
     [ -f "$CONF" ] || { echo "配置文件 $CONF 不存在，请先安装"; exit 1; }
     local key=$1 val=$2
     case "$key" in
@@ -535,10 +641,19 @@ cmd_set() {
                sed -i "s/^TEMP_OFF=.*/TEMP_OFF=$val/" "$CONF" ;;
         hdd)   [ "$val" -gt 0 ] 2>/dev/null || { echo "温度需为正整数"; exit 1; }
                sed -i "s/^HDD_ON_TEMP=.*/HDD_ON_TEMP=$val/" "$CONF" ;;
-        *) echo "用法: oesp-fanctl set <on|off|hdd> <值>"; exit 1 ;;
+        mode)  case "$val" in
+                   auto|on|off) ;;
+                   *) echo "用法: oesp-fanctl set mode <auto|on|off>"; exit 1 ;;
+               esac
+               if grep -q '^FAN_MODE=' "$CONF"; then
+                   sed -i "s/^FAN_MODE=.*/FAN_MODE=$val/" "$CONF"
+               else
+                   printf 'FAN_MODE=%s\n' "$val" >> "$CONF"
+               fi ;;
+        *) echo "用法: oesp-fanctl set <on|off|hdd|mode> <值>"; exit 1 ;;
     esac
     echo "已更新，守护进程 2 秒内自动生效："
-    grep -E "^(TEMP_ON|TEMP_OFF|HDD_ON_TEMP)=" "$CONF"
+    grep -E "^(FAN_MODE|TEMP_ON|TEMP_OFF|HDD_ON_TEMP)=" "$CONF"
 }
 
 # ---------- 手动测试 ----------
@@ -578,8 +693,9 @@ case "$1" in
     daemon|"") cmd_daemon ;;
     status)    cmd_status ;;
     set)       cmd_set "$2" "$3" ;;
+    mode)      cmd_set mode "$2" ;;
     test)      cmd_test "$2" ;;
     restore)   cmd_restore ;;
-    log)       tail -n 30 "$LOG" 2>/dev/null || echo "暂无日志" ;;
-    *)         echo "用法: oesp-fanctl <daemon|status|set|test|restore|log>"; exit 1 ;;
+    log)       resolve_paths; tail -n 30 "$LOG" 2>/dev/null || echo "暂无日志" ;;
+    *)         echo "用法: oesp-fanctl <daemon|status|set|mode|test|restore|log>"; exit 1 ;;
 esac

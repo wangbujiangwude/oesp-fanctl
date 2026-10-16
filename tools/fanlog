@@ -46,13 +46,26 @@ fan_state() {
     printf '%s' "${v:-?}"
 }
 
+# 运行模式：auto / on / off
+fan_mode() {
+    local v
+    v=$(grep -o 'mode=[a-z]*' "$STATE" 2>/dev/null | head -1 | cut -d= -f2)
+    case "$v" in
+        on)  printf '常开' ;;
+        off) printf '常关' ;;
+        auto) printf '自动' ;;
+        *)   printf '?' ;;
+    esac
+}
+
 line() {
-    printf '[%s] 温度=%s℃ GPU=%s℃ 硬盘=%s℃ 风扇=%s\n' \
+    printf '[%s] 温度=%s℃ GPU=%s℃ 硬盘=%s℃ 风扇=%s 模式=%s\n' \
         "$(date '+%F %T')" \
         "$(fmt_t "$CPU_NODE")" \
         "$(fmt_t "$GPU_NODE")" \
         "$(fmt_t "$DISK_NODE")" \
-        "$(fan_state)"
+        "$(fan_state)" \
+        "$(fan_mode)"
 }
 
 case "${1:-}" in
@@ -68,6 +81,7 @@ case "${1:-}" in
     *)
         iv="${1:-3}"
         echo "OESP 风扇实时监控（间隔 ${iv}s，Ctrl+C 退出）"
+        echo "运行模式: $(fan_mode)（auto=自动温控 / on=常开 / off=常关）"
         echo "CPU开启/关闭阈值: $(grep -oE '^TEMP_(ON|OFF)=[0-9]+' /vol1/@appconf/oesp-fanctl/oesp-fanctl.conf 2>/dev/null | tr '\n' ' ')"
         while :; do
             line
