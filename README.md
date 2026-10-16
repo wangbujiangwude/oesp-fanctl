@@ -50,12 +50,12 @@ OES Plus 刷飞牛 fnOS 之后，风扇控制有三个绕不过去的坑：
 - 🧹 **自动接管冲突服务**
   安装后自动停用并禁用 `fanctl.service`、`pwm-fancontrol.service`、`fan-fullspeed.service`，并清理残留进程。
 
-- 🔀 **三种运行模式（1.11 新增）**
+- 🔀 **三种运行模式（1.11 新增，1.14 起网页点击即生效）**
   - **自动温控**（默认）：按 CPU / 硬盘温度启停
   - **常开**：风扇一直运行，忽略温度判定 —— 适合夏季高温、硬盘密集或追求稳定的场景
   - **常关**：风扇一直停止，忽略温度判定 —— 适合夜间静音（⚠ 此模式下过热紧急保护也不触发）
 
-  网页一键切换，或命令行 `oesp-fanctl mode on`，2 秒内生效。
+  网页里点一下即生效（**无需再点保存按钮**），或命令行 `oesp-fanctl mode on`，守护进程 2 秒内应用。
 
 - 🌡️ **CPU 智能温控**
   高于「CPU 开启温度」自动开，低于「CPU 关闭温度」自动关；带迟滞防抖（连续 N 次超温才启动）与最短运行时间保护（默认 60 秒），不频繁启停。
@@ -86,12 +86,12 @@ OES Plus 刷飞牛 fnOS 之后，风扇控制有三个绕不过去的坑：
 
 ### 方式一：应用中心（推荐）
 
-应用中心 → **手动安装** → 选择 `release/oesp-fanctl_1.9_arm.fpk`
+应用中心 → **手动安装** → 选择 `release/oesp-fanctl_1.14_arm.fpk`
 
 ### 方式二：命令行
 
 ```bash
-appcenter-cli install-fpk /path/to/oesp-fanctl_1.9_arm.fpk
+appcenter-cli install-fpk /path/to/oesp-fanctl_1.14_arm.fpk
 ```
 
 ### 安装后自动完成的事
@@ -165,7 +165,7 @@ oesp-fanctl mode off     # 常关：风扇一直停止
 oesp-fanctl set mode on  # 等价写法
 ```
 
-也可以直接在 Web 监控页顶部的「风扇运行模式」里点选，保存后 2 秒内生效。
+也可以直接在 Web 监控页的「风扇运行模式」里点选，**点击即生效**，无需再点保存按钮；守护进程 2 秒内应用。
 
 | 配置项 | 说明 | 默认 |
 |---|---|---|
@@ -236,8 +236,18 @@ oesp-fanctl set mode on  # 等价写法
 | 8 | **温度未到关闭阈值就提前停风扇** | 用 `${temp_f%.*}` 截断小数：35.9℃ 被当成 35℃ | 改用毫摄氏度原始值精确比较；日志温度与判定温度取自同一次读数 |
 | 9 | **SSH 里执行 `set`/`mode` 报「配置文件不存在」** | 命令行执行时没有 appcenter 注入的 `OESP_FANCTL_CONF`，路径回落到 `/etc/oesp-fanctl.conf` | 新增 `resolve_paths()` 自动发现 conf/state/log/history |
 | 10 | **紧急保护退出瞬间风扇闪停一个周期** | 紧急标志一退，CPU 温控的防抖计数还没攒够 | 进入紧急保护时同步置位 CPU 温控路径 |
+| 11 | **Web 里点「常开 / 常关」后还要再点一次保存才生效** | 模式按钮只改前端高亮，必须靠表单提交 | 按钮改为点击即发 `POST /api/config`，只提交 `FAN_MODE`（不动温度阈值） |
 
 ### 更新日志
+
+**1.14**
+- ✨ **Web「运行模式」改为点击即生效**（无需再点保存按钮）
+  - 点「自动温控 / 常开 / 常关」立刻发请求写入配置，守护进程 2 秒内应用
+  - 请求只提交 `FAN_MODE` 一个字段，**不会顺带改动温度阈值**，也不会覆盖你正在输入但还没保存的数值
+  - 切换过程中按钮显示转圈并锁定，防止连点；失败会自动回退到原模式并提示原因
+  - 切换成功后自动回读状态，风扇徽标 / 卡片上的「运行中 · 常开」同步刷新
+  - 「保存」按钮文案改为「保存温度设置」，职责收窄为只保存 CPU / 硬盘温度阈值
+- 📦 附：本版同时提供了 `pack.py` 一键打包脚本（重建 `app.tgz` → 回写 `checksum` → 产出 `.fpk`）
 
 **1.13 / 1.12 / 1.11**
 - ✨ **新增「运行模式」：常开 / 常关 / 自动温控**（`FAN_MODE`）
@@ -300,12 +310,13 @@ oesp-fanctl set mode on  # 等价写法
 ├── config/                   # FPK 级权限与资源声明
 ├── wizard/                   # 安装向导
 ├── tools/
-│   └── fanlog                # 实时温度监控命令
+│   ├── fanlog                # 实时温度监控命令
+│   └── pack.py               # 一键打包脚本（重建 app.tgz → 回写 checksum → 产出 .fpk）
 ├── docs/
 │   ├── 推文-微信公众号.md
 │   └── 推文-飞牛论坛.md
 └── release/
-    └── oesp-fanctl_1.9_arm.fpk
+    └── oesp-fanctl_1.14_arm.fpk
 ```
 
 ---
@@ -313,6 +324,15 @@ oesp-fanctl set mode on  # 等价写法
 ## 自行构建 FPK
 
 FPK 本质是 **gzip 压缩的 tar 包**，内层 `app.tgz` 为应用文件，`manifest` 记录元数据。
+
+**推荐：用仓库自带的打包脚本**（自动重建 `app.tgz`、回写 `checksum`、产出 `.fpk`）：
+
+```bash
+python tools/pack.py          # 用 manifest 里的版本号
+python tools/pack.py 1.15     # 指定版本（同时写回 manifest）
+```
+
+**手动方式**（等价，需自行注意执行权限位与 LF 换行）：
 
 ```bash
 # 1) 打包内层 app.tgz（注意保留执行权限位）
@@ -323,13 +343,14 @@ MD5=$(md5sum app.tgz | cut -d' ' -f1)
 sed -i "s/^checksum.*/checksum              = $MD5/" manifest
 
 # 3) 打包 FPK
-tar -czf oesp-fanctl_1.9_arm.fpk app.tgz LICENSE cmd config ICON.PNG ICON_256.PNG manifest wizard
+tar -czf oesp-fanctl_1.14_arm.fpk app.tgz LICENSE cmd config ICON.PNG ICON_256.PNG manifest wizard
 ```
 
 **要点**：
 - `checksum = md5(app.tgz)`，不一致会被应用中心拒绝（错误码 `18000`）
 - 所有脚本必须是 **LF 换行**，否则 shebang 失效
 - 执行权限位必须在 tar 里保留（`chmod +x` 后再打包）
+- 已安装应用无法用 `install-fpk` 覆盖（对已装应用是空操作）→ 升级流程为「应用中心停应用 → 原地覆盖文件 → 启动应用」
 
 ---
 

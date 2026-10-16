@@ -240,6 +240,13 @@ form{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end}
       box-shadow:0 3px 14px rgba(56,190,255,.35)}
 .seg button.act.hot{background:linear-gradient(135deg,#f59e0b,#dc2626);color:#fff;
       box-shadow:0 3px 14px rgba(220,38,38,.35)}
+.seg button:disabled{opacity:.55;cursor:progress}
+.seg button.busy{position:relative;color:transparent!important}
+.seg button.busy::after{content:'';position:absolute;inset:0;margin:auto;width:13px;height:13px;
+      border:2px solid rgba(8,145,178,.3);border-top-color:var(--cyan);border-radius:50%;
+      animation:spin .6s linear infinite}
+.seg button.act.busy::after{border-color:rgba(3,18,28,.28);border-top-color:#03121c}
+.seg button.act.hot.busy::after{border-color:rgba(255,255,255,.35);border-top-color:#fff}
 .save{flex:none;margin-left:auto;padding:11px 26px;border:0;border-radius:12px;font-size:14px;
       font-weight:700;color:#03121c;background:linear-gradient(135deg,var(--cyan),var(--blue));cursor:pointer;
       box-shadow:0 4px 20px rgba(56,190,255,.35);transition:.2s}
@@ -279,7 +286,7 @@ form{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end}
     <h2><span class="bar"></span>温控阈值设置</h2>
     <form id="cfgform" onsubmit="return saveCfg(event)">
       <div class="field" style="flex:1 1 100%;margin-bottom:14px">
-        <label>风扇运行模式</label>
+        <label>风扇运行模式（点击即生效，无需保存）</label>
         <div class="seg" id="modeseg">
           <button type="button" data-mode="auto">自动温控</button>
           <button type="button" data-mode="on">常开 · 一直运行</button>
@@ -291,7 +298,7 @@ form{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end}
       <div class="field"><label>CPU 关闭温度（℃）</label><input id="TEMP_OFF" type="number" min="10" max="85"></div>
       <div class="field"><label>硬盘开启温度（℃）</label><input id="HDD_ON_TEMP" type="number" min="30" max="70"></div>
       <div class="field"><label>硬盘通风时间（秒）</label><input id="HDD_RUN_SECONDS" type="number" min="30" max="1800"></div>
-      <button class="save" type="submit">保存（立即生效）</button>
+      <button class="save" type="submit">保存温度设置</button>
     </form>
     <div id="msg"></div>
   </div>
@@ -306,7 +313,6 @@ const MODE_HINT = {
   on:'风扇将持续全速运行，忽略温度判定；适合夏季高温或硬盘密集场景',
   off:'风扇将持续停止，忽略温度判定；注意：此模式下过热紧急保护也不会触发，请留意散热风险'
 };
-let curMode = 'auto';
 let visible = { cpu:true, gpu:true, d1:true, d2:true, d3:true };
 let historyData = null;
 let diskLabels = [];
@@ -435,7 +441,7 @@ async function refreshState(){
         const el = document.getElementById(k);
         if (el && s.conf[k] !== undefined) el.value = s.conf[k];
       }
-      if (s.conf.FAN_MODE) { curMode = s.conf.FAN_MODE; paintMode(); }
+      if (s.conf.FAN_MODE && !modeBusy) { curMode = s.conf.FAN_MODE; paintMode(); }
     }
   } catch(e) {}
 }
@@ -533,7 +539,10 @@ function renderLegend(){
   }
 }
 
-/* ---------- 运行模式 ---------- */
+/* ---------- 运行模式：点击立即生效（无需保存按钮） ---------- */
+let curMode = 'auto';
+let modeBusy = false;
+
 function paintMode(){
   document.querySelectorAll('#modeseg button').forEach(b => {
     const on = b.dataset.mode === curMode;
@@ -543,25 +552,61 @@ function paintMode(){
   const h = document.getElementById('modehint');
   if (h) h.textContent = MODE_HINT[curMode] || '';
 }
+
+function setMsg(text, color){
+  const msg = document.getElementById('msg');
+  if (!msg) return;
+  msg.style.color = color; msg.textContent = text;
+}
+
+async function applyMode(mode, btn){
+  if (modeBusy || mode === curMode) return;
+  const prev = curMode;
+  modeBusy = true;
+  curMode = mode; paintMode();                      // 乐观更新，点击即反馈
+  const btns = document.querySelectorAll('#modeseg button');
+  btns.forEach(b => { b.disabled = true; if (b === btn) b.classList.add('busy'); });
+  setMsg('正在切换到「' + MODE_TXT[mode] + '」…', '#64748b');
+  try {
+    const r = await fetch('api/config', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ FAN_MODE: mode })       // 只提交模式，不动温度阈值
+    });
+    const j = await r.json();
+    if (j.ok) {
+      setMsg('✓ 已切换为「' + MODE_TXT[mode] + '」，守护进程 2 秒内生效', '#059669');
+      refreshState();                              // 立即回读一次真实状态
+      setTimeout(refreshState, 2300);              // 守护进程生效后再回读，刷新风扇徽标
+    } else {
+      curMode = prev; paintMode();
+      setMsg('切换失败：' + (j.error || ''), '#dc2626');
+    }
+  } catch(e) {
+    curMode = prev; paintMode();
+    setMsg('切换失败：' + e, '#dc2626');
+  } finally {
+    modeBusy = false;
+    btns.forEach(b => { b.disabled = false; b.classList.remove('busy'); });
+  }
+}
 document.querySelectorAll('#modeseg button').forEach(b => {
-  b.onclick = () => { curMode = b.dataset.mode; paintMode(); };
+  b.onclick = () => applyMode(b.dataset.mode, b);
 });
 paintMode();
 
-/* ---------- 保存配置 ---------- */
+/* ---------- 保存温度设置 ---------- */
 async function saveCfg(ev){
   ev.preventDefault();
   const body = { FAN_MODE: curMode };
   for (const k of ['TEMP_ON', 'TEMP_OFF', 'HDD_ON_TEMP', 'HDD_RUN_SECONDS'])
     body[k] = parseInt(document.getElementById(k).value, 10);
-  const msg = document.getElementById('msg');
-  if (body.TEMP_ON <= body.TEMP_OFF) { msg.style.color = '#dc2626'; msg.textContent = 'CPU 开启温度必须高于关闭温度'; return false; }
+  if (body.TEMP_ON <= body.TEMP_OFF) { setMsg('CPU 开启温度必须高于关闭温度', '#dc2626'); return false; }
   try {
     const r = await fetch('api/config', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
     const j = await r.json();
-    if (j.ok) { msg.style.color = '#059669'; msg.textContent = '✓ 已保存，守护进程 2 秒内生效'; }
-    else { msg.style.color = '#dc2626'; msg.textContent = '保存失败：' + (j.error || ''); }
-  } catch(e) { msg.style.color = '#dc2626'; msg.textContent = '保存失败：' + e; }
+    if (j.ok) { setMsg('✓ 温度设置已保存，守护进程 2 秒内生效', '#059669'); refreshState(); }
+    else { setMsg('保存失败：' + (j.error || ''), '#dc2626'); }
+  } catch(e) { setMsg('保存失败：' + e, '#dc2626'); }
   return false;
 }
 

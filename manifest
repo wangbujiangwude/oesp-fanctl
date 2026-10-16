@@ -1,5 +1,5 @@
 appname               = oesp-fanctl
-version               = 1.13
+version               = 1.14
 display_name          = OESP风扇助手
 desc                  = 专为 OES Plus（Amlogic S922X）刷飞牛 fnOS 打造的智能温控风扇管理工具。<br><br>🔧 <b>GPIO 直控 · 安装即用</b><br>· 自动从设备树读取风扇 GPIO 引脚，卸载内核 gpio-fan 驱动后由本应用直接控制，不受内核 <60℃ 调控器覆盖<br>· 安装后自动接管/停用系统自带风扇服务（fanctl / pwm-fancontrol / fan-fullspeed），开箱即可正常转<br>· 兼容厂商 DTB 引脚变更（46→45），以后系统更新也不怕引脚漂移<br><br>🌀 <b>风扇控制说明</b><br>· 设备内置风扇为 GPIO 二态开关风扇，仅支持「开 / 关」控制，不支持转速 / 档位调节<br><br>🔀 <b>三种运行模式（可随时切换）</b><br>· <b>自动温控</b>：按 CPU / 硬盘温度自动启停（默认）<br>· <b>常开</b>：风扇一直运行，忽略温度判定 —— 适合夏季高温、硬盘密集或追求稳定的场景<br>· <b>常关</b>：风扇一直停止，忽略温度判定 —— 适合夜间静音（⚠ 此模式下过热紧急保护也不触发，请留意散热）<br>· 网页一键切换，或命令行 <code>oesp-fanctl mode on</code>，2 秒内生效<br><br>🌡️ <b>智能温控 · CPU 自动启停</b><br>· 默认 38℃ 开 / 35℃ 关（可在网页内随时调整）<br>· 高于「CPU 开启温度」自动开启，低于「CPU 关闭温度」自动停止<br>· 带迟滞防抖与最短运行时间（60 秒）保护，避免频繁启停<br>· 温度按 0.1℃ 精确比较，不会「还没到关闭温度就提前停风扇」<br><br>💨 <b>硬盘定时通风</b><br>· 任一硬盘达到「硬盘开启温度」即开启风扇，运行设定时长（可调 30–1800 秒）后自动关闭<br>· 关闭后经停机间歇（默认 60 秒）再次测温，若仍超温则开启新一轮，循环至降温<br><br>🛡️ <b>紧急兜底保护</b><br>· CPU ≥ 70℃ 或 任一硬盘 ≥ 55℃ 时强制开启风扇，防止过热<br><br>📊 <b>硬件实时监控</b><br>· CPU / GPU / 三盘位硬盘（sda/sdb/sdc）温度一目了然，未插盘显示“空”<br>· 12 小时历史温度曲线，每分钟采样一点<br>· 风扇运行状态与当前模式实时显示（运行中 / 已停止 · 自动 / 常开 / 常关）<br><br>⚙️ <b>在线设置</b><br>· 网页内切换运行模式，调整 CPU 开关温度、硬盘通风开启温度与通风时长<br>· 通过系统统一网关访问：/app/oesp-fanctl
 platform              = arm
@@ -10,4 +10,4 @@ distributor           = 老汪不讲武德
 distributor_url       = https://club.fnnas.com
 desktop_uidir         = ui
 desktop_applaunchname = oesp-fanctl.Application
-checksum              = 2e2262dfc039205a0e8c5e33cf595ea8
+checksum              = a6a3d4e3b64ed6cca35284fbf38028d2
