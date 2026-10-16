@@ -428,6 +428,13 @@ fnOS 的 `appcenter-cli` 不支持升级已安装应用（`install-fpk` 对已�
 
 ---
 
+## 反馈与交流
+
+- **项目主页 / 问题反馈**：<https://github.com/wangbujiangwude/oesp-fanctl>
+- **微信公众号**（应用介绍与更新）：<https://mp.weixin.qq.com/s/84uib8c63WJFSbnMQF7JOg>
+
+---
+
 ## 许可
 
 [MIT License](LICENSE) © 2026 老汪不讲武德
