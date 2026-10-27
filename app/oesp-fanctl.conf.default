@@ -8,12 +8,30 @@
 FAN_MODE=auto
 TEMP_ON=38              # CPU 高于此温度开风扇（℃）
 TEMP_OFF=35             # CPU 低于此温度关风扇（℃）
+
+# 启停防抖（2026-10-27 新增）：温度要「持续」超限多少秒才动作，避免阈值附近频繁启停
+# ON_DELAY=5  表示 CPU 连续 5 秒 >= TEMP_ON 才开风扇
+# OFF_DELAY=5 表示 CPU 连续 5 秒 <= TEMP_OFF 才关风扇
+ON_DELAY=5              # 开启延迟（秒），0 = 一达到温度就开
+OFF_DELAY=5             # 关闭延迟（秒），0 = 一低于温度就关
+TEMP_FILTER=3           # CPU 温度中位数滤波点数（1=不滤波；3/5 可抑制探针瞬间毛刺）
+
 HDD_ON_TEMP=50          # 任一硬盘达到此温度启动定时通风（℃）
 HDD_RUN_SECONDS=60      # 硬盘触发后风扇运行时长（秒），到时自动关闭
 HDD_COOLDOWN=60         # 通风结束后强制停机间歇（秒），间歇结束若仍超温再开新一轮
 EMERGENCY_TEMP=70       # CPU 超过此温度强制开启风扇（℃）
 DISK_EMERGENCY_TEMP=55  # 任一硬盘超过此温度强制开启风扇（℃，纯兜底保护）
 INTERVAL=2              # 检测周期（秒）
-STABLE_COUNT=3          # 连续 N 次超温才启动风扇
 MIN_RUN=60              # CPU 温控风扇最短运行时间（秒）
 DISK_CHECK_CYCLES=10    # 每 N 个周期读一次硬盘温度（仅用于显示/曲线）
+
+# 硬盘温度监控（2026-10-27 新增）：决定是否读硬盘温度，以及会不会影响硬盘休眠
+#   auto = 仅在硬盘已唤醒时读温度（用 hdparm -C 探测，standby 就跳过）—— 推荐，不影响休眠
+#   on   = 始终读取（数据最全，但会持续访问硬盘，可能让硬盘无法休眠）
+#   off  = 完全不读硬盘温度（确保硬盘可休眠；硬盘定时通风与硬盘过热兜底随之停用）
+# 可用命令切换：oesp-fanctl set hddmon auto
+HDD_MONITOR=auto
+
+# 【已废弃】旧版用「连续 N 次采样」做防抖，现已由 ON_DELAY / OFF_DELAY 取代，
+# 保留此行仅为兼容旧配置，修改它不会产生任何效果
+STABLE_COUNT=3

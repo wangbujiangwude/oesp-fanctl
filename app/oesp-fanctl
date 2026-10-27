@@ -24,7 +24,17 @@
 #     运行时可切换，守护进程 2 秒内生效：oesp-fanctl set mode on
 #     ⚠ 注意：on / off 为强制覆盖模式，会同时忽略「过热紧急保护」。
 #        off 模式下即使 CPU 超过 EMERGENCY_TEMP 也不会开风扇，请留意散热风险。
-#   · CPU 迟滞温控：>=TEMP_ON 开，<=TEMP_OFF 关（带连续计数防抖 + 最短运行时间）
+#   · CPU 迟滞温控：>=TEMP_ON 开，<=TEMP_OFF 关
+#   · 探针抗噪（2026-10-27 新增）：CPU 温度先做有效性校验（读取失败/0/超量程不参与判定），
+#     再做 TEMP_FILTER 点中位数滤波 —— 本机 thermal_zone0 单点读数会在 34~39℃ 间跳 4℃，
+#     单点判定会造成「看着没到阈值却停风扇」。
+#   · 双向持续时间防抖（2026-10-27 新增）：
+#     温度持续 >=TEMP_ON 达 ON_DELAY 秒才开，持续 <=TEMP_OFF 达 OFF_DELAY 秒才关；
+#     配合 MIN_RUN 最短运行时间，彻底避免阈值附近频繁启停。
+#   · 硬盘监控可关（2026-10-27 新增）：HDD_MONITOR=auto|on|off
+#       auto = 仅在硬盘已唤醒时读温度（用 hdparm -C 探测，standby 就跳过，不影响休眠）
+#       on   = 始终读取（会持续唤醒硬盘）
+#       off  = 完全不读硬盘温度（硬盘可正常休眠，硬盘通风与硬盘兜底随之停用）
 #   · 硬盘定时通风：任一盘 >=HDD_ON_TEMP 开，运行 HDD_RUN_SECONDS 后停机 HDD_COOLDOWN 秒，
 #     间歇结束仍超温则开新一轮，降温则保持关
 #   · 过热紧急保护：CPU / 硬盘过高强制开启（兜底）
@@ -37,6 +47,8 @@
 #   oesp-fanctl set on 38       设置 CPU 开启温度
 #   oesp-fanctl set off 35      设置 CPU 关闭温度
 #   oesp-fanctl set hdd 50      设置硬盘定时通风开启温度
+#   oesp-fanctl set delay 5     设置开/关防抖秒数（高温/低温需持续多久才动作）
+#   oesp-fanctl set hddmon off  硬盘温度监控：auto=仅唤醒时读 / on=始终读 / off=不读
 #   oesp-fanctl set mode on     设置运行模式（auto=自动温控 / on=常开 / off=常关）
 #   oesp-fanctl mode on         同上，简写
 #   oesp-fanctl test on|off     手动开/关风扇测试（一次性，会短暂抢占控制权）
@@ -61,9 +73,13 @@ HDD_COOLDOWN=60         # 通风结束后强制停机间歇（秒）；间歇结
 EMERGENCY_TEMP=70       # CPU 超过此温度强制开启风扇（℃）
 DISK_EMERGENCY_TEMP=55  # 任一硬盘超过此温度强制开启风扇（℃，纯兜底）
 INTERVAL=2              # 检测周期（秒）
-STABLE_COUNT=3          # CPU 连续 N 次超温才启动风扇（防抖动）
+ON_DELAY=5              # 温度持续高于 TEMP_ON 达 N 秒才开风扇（防抖，0=立即）
+OFF_DELAY=5             # 温度持续低于 TEMP_OFF 达 N 秒才关风扇（防抖，0=立即）
+TEMP_FILTER=3           # CPU 温度中位数滤波窗口（1=不滤波；3/5 可抑制探针毛刺）
 MIN_RUN=60              # CPU 温控风扇最短运行时间（秒）
 DISK_CHECK_CYCLES=10    # 每 N 个周期读一次硬盘温度（smartctl 开销大）
+HDD_MONITOR=auto        # 硬盘温度监控：auto=仅在硬盘已唤醒时读（不影响休眠）/ on=始终读 / off=完全不读
+STABLE_COUNT=3          # 【已废弃】旧版防抖计数，保留仅为兼容旧配置，现由 ON_DELAY 取代
 
 load_conf() {
     resolve_paths
@@ -246,25 +262,81 @@ get_temp_milli() {  # 原始毫摄氏度整数（不做任何截断，专用于�
     cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo 0
 }
 
+# ---------- CPU 温度：有效性校验 + 中位数滤波 ----------
+# 背景（2026-10-27 在 OESP 实测）：thermal_zone0 连续 10 次读数落在 34.4~38.6℃，
+# 单点波动可达 4℃，直接拿单点值判定，就会出现「看着没到阈值却把风扇停了」的现象。
+# 对策三层：
+#   ① 读数无效（读取失败 / 0 / 超量程）时绝不参与判定，沿用上次有效值；
+#   ② 用最近 N 个采样的「中位数」作为判定值，抑制单点毛刺（TEMP_FILTER）；
+#   ③ 状态切换再由 ON_DELAY / OFF_DELAY 做持续时间确认。
+TEMP_HIST=()
+TEMP_LAST_VALID=0
+
+read_cpu_raw() {   # 成功输出毫摄氏度；失败返回非 0
+    local raw
+    raw=$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null)
+    case "$raw" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    # 0 或 >150℃ 视为读取异常：绝不能拿它去判定，否则会误关风扇
+    [ "$raw" -gt 0 ] && [ "$raw" -lt 150000 ] || return 1
+    echo "$raw"
+}
+
+push_temp() {      # $1 = 有效毫摄氏度
+    local lim=${TEMP_FILTER:-3}
+    case "$lim" in ''|*[!0-9]*) lim=3 ;; esac
+    [ "$lim" -lt 1 ] && lim=1
+    TEMP_HIST+=("$1")
+    while [ "${#TEMP_HIST[@]}" -gt "$lim" ]; do
+        TEMP_HIST=("${TEMP_HIST[@]:1}")
+    done
+    TEMP_LAST_VALID=$1
+}
+
+filtered_temp() {  # 输出中位数（无数据时用上次有效值）
+    local n=${#TEMP_HIST[@]}
+    if [ "$n" -eq 0 ]; then echo "${TEMP_LAST_VALID:-0}"; return; fi
+    if [ "$n" -eq 1 ]; then echo "${TEMP_HIST[0]}"; return; fi
+    printf '%s\n' "${TEMP_HIST[@]}" | sort -n | sed -n "$(( (n + 1) / 2 ))p"
+}
+
+fmt_temp() {       # 毫摄氏度 → 一位小数
+    local t=${1:-0}
+    printf '%d.%d' $(( t / 1000 )) $(( (t % 1000) / 100 ))
+}
+
 get_temp() {  # 一位小数温度（℃），仅用于显示/记录
     local t
     t=$(get_temp_milli)
     printf '%d.%d' $(( t / 1000 )) $(( (t % 1000) / 100 ))
 }
 
-# ---------- GPU 温度探测 ----------
+# ---------- 第二路温度探测（GPU / DDR）----------
+# 注意：OESP（Amlogic S922X）没有独立 GPU 热区，thermal_zone1 的 type 是
+# "ddr-thermal"（内存温度），旧版无脑把它当 GPU 显示是错的，这里按实际 type 标注。
 GPU_NODE=""
+GPU_LABEL=""
 detect_gpu() {
-    GPU_NODE=""
-    local z
+    GPU_NODE=""; GPU_LABEL=""
+    local z tp
     for z in /sys/class/thermal/thermal_zone*; do
-        case "$(cat "$z/type" 2>/dev/null)" in
-            *gpu*|*GPU*|*gpu-thermal*)
-                [ -f "$z/temp" ] && { GPU_NODE="$z/temp"; return; } ;;
+        tp=$(cat "$z/type" 2>/dev/null)
+        case "$tp" in
+            *gpu*|*GPU*)
+                [ -f "$z/temp" ] && { GPU_NODE="$z/temp"; GPU_LABEL="GPU"; return; } ;;
         esac
     done
-    [ -f /sys/class/thermal/thermal_zone1/temp ] \
-        && GPU_NODE=/sys/class/thermal/thermal_zone1/temp
+    # 回退：取 zone1，并按它的真实 type 命名（本机为 ddr-thermal → DDR）
+    if [ -f /sys/class/thermal/thermal_zone1/temp ]; then
+        GPU_NODE=/sys/class/thermal/thermal_zone1/temp
+        tp=$(cat /sys/class/thermal/thermal_zone1/type 2>/dev/null)
+        case "$tp" in
+            *ddr*|*DDR*) GPU_LABEL="DDR" ;;
+            *soc*|*SOC*) GPU_LABEL="SOC" ;;
+            *)           GPU_LABEL="SOC" ;;
+        esac
+    fi
 }
 
 get_gpu_temp() {
@@ -298,11 +370,44 @@ detect_disks() {
 
 DISK_TEMPS_OUT=""
 DISK_MAX_TEMP=0
+DISK_READ_STATE="ok"    # ok / asleep（有盘在休眠被跳过）/ off（监控已关闭）
+
+# 硬盘是否处于休眠（standby / sleep）。
+# hdparm -C 发的是 CHECK POWER MODE，不会把盘唤醒，可安全用作前置探测。
+disk_asleep() {
+    local dev="/dev/$1" st
+    [ -b "$dev" ] || return 1
+    command -v hdparm >/dev/null 2>&1 || return 1
+    st=$(hdparm -C "$dev" 2>/dev/null | grep -oE 'standby|sleep|active/idle|idle|unknown')
+    case "$st" in standby|sleep) return 0 ;; *) return 1 ;; esac
+}
+
+normalize_hddmon() {
+    case "${1:-auto}" in
+        off|OFF|Off|0|no|false|disable|disabled)  echo off ;;
+        on|ON|On|1|yes|true|always|force)         echo on ;;
+        *)                                        echo auto ;;
+    esac
+}
+
 read_disk_temps() {
-    DISK_TEMPS_OUT=""; DISK_MAX_TEMP=0
-    local i s t ti
+    DISK_TEMPS_OUT=""; DISK_MAX_TEMP=0; DISK_READ_STATE="ok"
+    local mode skipped=0 i s t ti lbl
+    mode=$(normalize_hddmon "${HDD_MONITOR:-auto}")
+
+    # off：完全不接触硬盘（不读 hwmon、不发 SMART），硬盘可正常进入休眠
+    if [ "$mode" = "off" ]; then
+        DISK_READ_STATE="off"
+        return 0
+    fi
+
     for i in "${!DISK_SOURCES[@]}"; do
-        s="${DISK_SOURCES[$i]}"; t=0
+        s="${DISK_SOURCES[$i]}"; lbl="${DISK_LABELS[$i]}"; t=0
+        # auto：盘已休眠则跳过本次读取，避免读取动作把它唤醒（不影响休眠的关键）
+        if [ "$mode" = "auto" ] && disk_asleep "$lbl"; then
+            skipped=$((skipped + 1))
+            continue
+        fi
         case "$s" in
             smart:*)
                 ti=$(smartctl -n standby -A "${s#smart:}" 2>/dev/null \
@@ -313,10 +418,12 @@ read_disk_temps() {
                 t=$(printf '%d.%d' $(( ti / 1000 )) $(( (ti % 1000) / 100 ))) ;;
         esac
         [ -z "$t" ] && t=0
-        DISK_TEMPS_OUT="${DISK_TEMPS_OUT}${DISK_LABELS[$i]}=$t
+        DISK_TEMPS_OUT="${DISK_TEMPS_OUT}${lbl}=$t
 "
         [ "${t%.*}" -gt "$DISK_MAX_TEMP" ] 2>/dev/null && DISK_MAX_TEMP=${t%.*}
     done
+    [ "$skipped" -gt 0 ] && DISK_READ_STATE="asleep"
+    return 0
 }
 
 log() {
@@ -369,7 +476,7 @@ cmd_daemon() {
     fi
 
     detect_gpu
-    [ -n "$GPU_NODE" ] && log "GPU 温度节点: $GPU_NODE"
+    [ -n "$GPU_NODE" ] && log "${GPU_LABEL:-SOC} 温度节点: $GPU_NODE"
 
     # --- 启动 Web 监控页 ---
     start_web() {
@@ -398,7 +505,9 @@ cmd_daemon() {
     # --- 状态变量 ---
     local cpu_fan=0
     local cpu_fan_start=0
-    local high_count=0
+    local hot_since=0          # 温度连续高于 TEMP_ON 的起始时刻（0=未在高温）
+    local cold_since=0         # 温度连续低于 TEMP_OFF 的起始时刻（0=未在低温）
+    local TEMP_READ_FAIL=0     # 温度读取异常告警去重
     local emergency=0
     local hdd_run_until=0
     local hdd_cool_until=0
@@ -406,11 +515,17 @@ cmd_daemon() {
     local cycle=0
     local dmax=0
     local cur_mode=""        # 已生效的运行模式（用于模式切换时只打一次日志）
+    local cur_hmon=""        # 已生效的硬盘监控方式（变更时立即重读，不等节流周期）
 
     detect_disks
+    case "$(normalize_hddmon "${HDD_MONITOR:-auto}")" in
+        off) log "硬盘温度监控已关闭（HDD_MONITOR=off）：完全不读硬盘，硬盘可正常休眠；仅按 CPU 温度控制" ;;
+        on)  log "硬盘温度监控：始终读取（HDD_MONITOR=on，会持续访问硬盘，可能影响休眠）" ;;
+        *)   log "硬盘温度监控：仅唤醒时读取（HDD_MONITOR=auto，硬盘休眠时自动跳过，不影响休眠）" ;;
+    esac
     if [ "${#DISK_SOURCES[@]}" -gt 0 ]; then
         log "硬盘温度源 ${#DISK_SOURCES[@]} 个: ${DISK_SOURCES[*]}"
-    else
+    elif [ "$(normalize_hddmon "${HDD_MONITOR:-auto}")" != "off" ]; then
         log "未找到硬盘温度源（可执行 modprobe drivetemp 后重启本服务），仅按 CPU 温度控制"
     fi
 
@@ -426,35 +541,60 @@ cmd_daemon() {
 
     while true; do
         load_conf
-        # tm = 毫摄氏度原始值，用于精确比较；temp_f = 一位小数，仅用于显示/记录
-        # ⚠ 不能用 ${temp_f%.*} 做比较：那会把 35.9℃ 截断成 35，
-        #   使「温度还没到 TEMP_OFF 就提前关风扇」（FPK 1.6 原版的遗留 BUG）。
-        local tm=$(get_temp_milli)
-        # temp_f 由同一个 tm 派生（只读一次传感器），否则日志温度与判定温度会不一致，
-        # 出现「CPU 35.2℃ <= 35℃，风扇停止」这类看起来自相矛盾的行。
-        local temp_f=$(printf '%d.%d' $(( tm / 1000 )) $(( (tm % 1000) / 100 )))
         local now=$(date +%s)
+        # --- 取温度：先做有效性校验，再进滤波窗口，用中位数做判定 ---
+        local raw_tm inst_f tm
+        if raw_tm=$(read_cpu_raw); then
+            push_temp "$raw_tm"
+            inst_f=$(fmt_temp "$raw_tm")
+            TEMP_READ_FAIL=0
+        else
+            # 读取失败 / 0 / 超量程：不进入滤波窗口，也不改变判定依据，沿用上次有效值。
+            # 旧版这里直接用 0 参与比较，会瞬间判定「<= TEMP_OFF」而误关风扇。
+            inst_f="?"
+            if [ "$TEMP_READ_FAIL" -eq 0 ]; then
+                log "警告：CPU 温度读取异常，暂用上次有效值 $(fmt_temp "$TEMP_LAST_VALID")℃ 继续控制"
+                TEMP_READ_FAIL=1
+            fi
+        fi
+        tm=$(filtered_temp)
+        # 冷启动尚未拿到任何有效读数：跳过本轮，绝不能让 0℃ 触发关风扇
+        if [ "$tm" -le 0 ]; then
+            sleep "$INTERVAL"; continue
+        fi
+        local temp_f=$(fmt_temp "$tm")
         cycle=$((cycle + 1))
 
-        if [ "${#DISK_SOURCES[@]}" -gt 0 ]; then
-            if [ $(( cycle % DISK_CHECK_CYCLES )) -eq 1 ] || [ "$cycle" -eq 1 ]; then
+        # 硬盘温度：off 必须当拍就清空（否则关掉监控后 Web 还会残留最多
+        # DISK_CHECK_CYCLES 个周期的旧读数，看起来像没关掉）；监控方式一变也当拍重读，
+        # 免得用户从 off 切回 auto 后要干等一个完整节流周期（约 20 秒）才有温度。
+        local hmon=$(normalize_hddmon "${HDD_MONITOR:-auto}")
+        local hmon_changed=0
+        [ "$hmon" != "$cur_hmon" ] && hmon_changed=1
+        if [ "$hmon" = "off" ]; then
+            DISK_TEMPS_OUT=""; DISK_MAX_TEMP=0; DISK_READ_STATE="off"
+        elif [ "${#DISK_SOURCES[@]}" -gt 0 ]; then
+            if [ "$hmon_changed" -eq 1 ] || [ $(( cycle % DISK_CHECK_CYCLES )) -eq 1 ] || [ "$cycle" -eq 1 ]; then
                 read_disk_temps
             fi
             [ $(( cycle % 150 )) -eq 0 ] && detect_disks
         else
             DISK_TEMPS_OUT=""; DISK_MAX_TEMP=0
         fi
+        cur_hmon=$hmon
         dmax=$DISK_MAX_TEMP
         local gpu_f=$(get_gpu_temp)
 
         # --- 运行模式（auto=自动温控 / on=常开 / off=常关）---
         local fan_mode=$(normalize_mode "${FAN_MODE:-auto}")
+        local just_switch=0
         if [ "$fan_mode" != "$cur_mode" ]; then
             case "$fan_mode" in
                 on)  log "运行模式 → 常开：风扇持续运行，忽略温度判定" ;;
                 off) log "运行模式 → 常关：风扇持续停止，忽略温度判定" ;;
                 *)   log "运行模式 → 自动温控：按 CPU / 硬盘温度启停" ;;
             esac
+            [ -n "$cur_mode" ] && just_switch=1   # 首次启动不算"切换"
             cur_mode=$fan_mode
         fi
         # -1 = 不覆盖（自动温控）；0 = 强制关；1 = 强制开
@@ -464,33 +604,48 @@ cmd_daemon() {
 
         if [ "$mode_override" -ge 0 ]; then
             # 常开 / 常关：完全跳过温度判定，并清零内部计数，
-            # 避免切回 auto 时残留的 high_count / 计时器造成误动作
-            cpu_fan=0; cpu_fan_start=0; high_count=0; emergency=0
+            # 避免切回 auto 时残留的防抖计时器造成误动作
+            cpu_fan=0; cpu_fan_start=0; emergency=0
+            hot_since=0; cold_since=0
             local hdd_want_on=0
             hdd_run_until=0; hdd_cool_until=0
         else
 
-        # --- CPU 温控（迟滞 + 最短运行）---
-        local cpu_hot=0 cpu_cold=1
+        # --- CPU 温控（中位数滤波 + 双向持续时间防抖 + 最短运行）---
+        # 开：温度持续 >= TEMP_ON 达 ON_DELAY 秒
+        # 关：温度持续 <= TEMP_OFF 达 OFF_DELAY 秒（且已运行 >= MIN_RUN 秒）
+        # 中间区间（TEMP_OFF ~ TEMP_ON）为死区，保持当前状态不动，计时器清零。
+        local cpu_hot=0 cpu_cold=0
         [ "$tm" -ge $(( TEMP_ON  * 1000 )) ] && cpu_hot=1
-        [ "$tm" -gt $(( TEMP_OFF * 1000 )) ] && cpu_cold=0
+        [ "$tm" -le $(( TEMP_OFF * 1000 )) ] && cpu_cold=1
         if [ "$cpu_hot" -eq 1 ]; then
-            high_count=$((high_count + 1))
-            if [ "$cpu_fan" -eq 0 ] && [ "$high_count" -ge "$STABLE_COUNT" ]; then
+            cold_since=0
+            if [ "$hot_since" -eq 0 ]; then
+                # 刚从常开/常关切回自动：视为「条件早已持续满足」，立即判定，
+                # 否则用户手动切回自动后还要干等 ON_DELAY 秒，体验很怪。
+                if [ "$just_switch" -eq 1 ]; then hot_since=$(( now - ${ON_DELAY:-0} ))
+                else hot_since=$now; fi
+            fi
+            if [ "$cpu_fan" -eq 0 ] && [ $(( now - hot_since )) -ge "${ON_DELAY:-0}" ]; then
                 cpu_fan=1; cpu_fan_start=$now
-                log "CPU ${temp_f}℃ >= ${TEMP_ON}℃，风扇启动（CPU 温控）"
+                log "CPU ${temp_f}℃（瞬时 ${inst_f}）>= ${TEMP_ON}℃ 已持续 $(( now - hot_since ))s，风扇启动（CPU 温控）"
             fi
         elif [ "$cpu_cold" -eq 1 ]; then
-            high_count=0
-            if [ "$cpu_fan" -eq 1 ]; then
+            hot_since=0
+            if [ "$cold_since" -eq 0 ]; then
+                if [ "$just_switch" -eq 1 ]; then cold_since=$(( now - ${OFF_DELAY:-0} ))
+                else cold_since=$now; fi
+            fi
+            if [ "$cpu_fan" -eq 1 ] && [ $(( now - cold_since )) -ge "${OFF_DELAY:-0}" ]; then
                 local run_secs=$(( now - cpu_fan_start ))
-                if [ "$run_secs" -ge "$MIN_RUN" ]; then
+                if [ "$run_secs" -ge "${MIN_RUN:-0}" ]; then
                     cpu_fan=0; cpu_fan_start=0
-                    log "CPU ${temp_f}℃ <= ${TEMP_OFF}℃，CPU 温控风扇停止"
+                    log "CPU ${temp_f}℃（瞬时 ${inst_f}）<= ${TEMP_OFF}℃ 已持续 $(( now - cold_since ))s，风扇停止（已运行 ${run_secs}s）"
                 fi
             fi
         else
-            high_count=0
+            # 死区：保持现状，避免在阈值附近来回抖
+            hot_since=0; cold_since=0
         fi
 
         # --- 过热紧急保护（带 5℃ 迟滞）---
@@ -508,8 +663,9 @@ cmd_daemon() {
             fi
             emergency=1
             # 同时把 CPU 温控路径置位：否则紧急保护退出（迟滞 5℃）的瞬间，
-            # 若防抖计数 STABLE_COUNT 还没攒够，want_on 会掉回 0 而让风扇闪停一个周期。
-            cpu_fan=1; cpu_fan_start=${cpu_fan_start:-$now}; high_count=$STABLE_COUNT
+            # 若 cpu_fan 还是 0，want_on 会掉回 0 而让风扇闪停一个周期。
+            cpu_fan=1; cpu_fan_start=${cpu_fan_start:-$now}
+            [ "$hot_since" -eq 0 ] && hot_since=$now
         else
             emergency=0
         fi
@@ -556,12 +712,16 @@ cmd_daemon() {
         # --- 状态文件（Web 页读取）---
         {
             echo "temp=$temp_f"
+            echo "temp_inst=$inst_f"
             echo "gpu=$gpu_f"
+            echo "gpu_label=${GPU_LABEL:-SOC}"
             echo "fan_state=$fan_state"
             echo "fan_target=$fan_state"
             echo "mode=$fan_mode"
             echo "backend=$FAN_BACKEND"
             [ "$FAN_BACKEND" = "gpio" ] && echo "gpio_chip=$GPIO_CHIP" && echo "gpio_line=$GPIO_LINE"
+            echo "hdd_monitor=$(normalize_hddmon "${HDD_MONITOR:-auto}")"
+            echo "hdd_state=$DISK_READ_STATE"
             echo "disk_max=$dmax"
             echo "$DISK_TEMPS_OUT" | while IFS='=' read -r k v; do
                 [ -n "$k" ] && echo "disk_$k=$v"
@@ -616,11 +776,18 @@ cmd_status() {
     esac
     echo "CPU 温度:  $(get_temp) ℃"
     detect_gpu
-    [ -n "$GPU_NODE" ] && echo "GPU 温度:  $(get_gpu_temp) ℃"
+    [ -n "$GPU_NODE" ] && echo "${GPU_LABEL:-SOC} 温度:  $(get_gpu_temp) ℃"
     detect_disks
-    if [ "${#DISK_SOURCES[@]}" -gt 0 ]; then
+    local hmon; hmon=$(normalize_hddmon "${HDD_MONITOR:-auto}")
+    if [ "$hmon" = "off" ]; then
+        echo "硬盘温度:  监控已关闭（不影响硬盘休眠）"
+    elif [ "${#DISK_SOURCES[@]}" -gt 0 ]; then
         read_disk_temps
-        echo "硬盘温度:  $(echo "$DISK_TEMPS_OUT" | tr '\n' ' ')（最高 ${DISK_MAX_TEMP} ℃）"
+        if [ "$DISK_READ_STATE" = "asleep" ]; then
+            echo "硬盘温度:  硬盘处于休眠，已跳过读取（不影响休眠）"
+        else
+            echo "硬盘温度:  $(echo "$DISK_TEMPS_OUT" | tr '\n' ' ')（最高 ${DISK_MAX_TEMP} ℃）"
+        fi
     else
         echo "硬盘温度:  无温度源（可 modprobe drivetemp）"
     fi
@@ -635,6 +802,13 @@ cmd_status() {
         *)   echo "运行模式:  自动温控（按温度启停）" ;;
     esac
     echo "CPU 开启/关闭阈值:  ${TEMP_ON} / ${TEMP_OFF} ℃"
+    echo "启停防抖:  高温持续 ${ON_DELAY:-0} 秒才开 / 低温持续 ${OFF_DELAY:-0} 秒才关（中位数滤波 ${TEMP_FILTER:-1} 点）"
+    echo "风扇最短运行:  ${MIN_RUN:-0} 秒"
+    case "$hmon" in
+        off)  echo "硬盘温度监控:  关闭（不读硬盘，硬盘可正常休眠；硬盘通风与硬盘兜底停用）" ;;
+        on)   echo "硬盘温度监控:  始终读取（数据最全，但会持续唤醒硬盘，可能影响休眠）" ;;
+        *)    echo "硬盘温度监控:  仅唤醒时读取（硬盘休眠时自动跳过，不影响休眠）" ;;
+    esac
     echo "硬盘定时通风阈值:  ${HDD_ON_TEMP} ℃（触发后运行 ${HDD_RUN_SECONDS}s，停机间歇 ${HDD_COOLDOWN}s）"
     echo "紧急强制开启:  CPU ${EMERGENCY_TEMP} ℃ / 硬盘 ${DISK_EMERGENCY_TEMP} ℃（兜底保护）"
     if [ -f "$STATE_FILE" ]; then
@@ -658,13 +832,40 @@ cmd_set() {
     local key=$1 val=$2
     local bak; bak=$(mktemp)
     cp "$CONF" "$bak" 2>/dev/null
+    # 写单个 key：存在则替换值（保留行尾注释），不存在则追加
+    set_kv() {
+        if grep -q "^$1=" "$CONF" 2>/dev/null; then
+            sed -i "s/^$1=[^[:space:]]*/$1=$2/" "$CONF"
+        else
+            printf '%s=%s\n' "$1" "$2" >> "$CONF"
+        fi
+    }
     case "$key" in
-        on)    [ "$val" -gt 0 ] 2>/dev/null || { rm -f "$bak"; echo "温度需为正整数"; exit 1; }
+        on|TEMP_ON|temp_on)
+               [ "$val" -gt 0 ] 2>/dev/null || { rm -f "$bak"; echo "温度需为正整数"; exit 1; }
                sed -i "s/^TEMP_ON=[^[:space:]]*/TEMP_ON=$val/" "$CONF" ;;
-        off)   [ "$val" -gt 0 ] 2>/dev/null || { rm -f "$bak"; echo "温度需为正整数"; exit 1; }
+        off|TEMP_OFF|temp_off)
+               [ "$val" -gt 0 ] 2>/dev/null || { rm -f "$bak"; echo "温度需为正整数"; exit 1; }
                sed -i "s/^TEMP_OFF=[^[:space:]]*/TEMP_OFF=$val/" "$CONF" ;;
-        hdd)   [ "$val" -gt 0 ] 2>/dev/null || { rm -f "$bak"; echo "温度需为正整数"; exit 1; }
+        hdd|HDD_ON_TEMP|hdd_on_temp)
+               [ "$val" -gt 0 ] 2>/dev/null || { rm -f "$bak"; echo "温度需为正整数"; exit 1; }
                sed -i "s/^HDD_ON_TEMP=[^[:space:]]*/HDD_ON_TEMP=$val/" "$CONF" ;;
+        delay|ondelay|offdelay)
+               case "$val" in ''|*[!0-9]*) rm -f "$bak"; echo "秒数需为非负整数"; exit 1 ;; esac
+               case "$key" in
+                   delay)    set_kv ON_DELAY "$val";  set_kv OFF_DELAY "$val" ;;
+                   ondelay)  set_kv ON_DELAY "$val" ;;
+                   offdelay) set_kv OFF_DELAY "$val" ;;
+               esac ;;
+        filter)
+               case "$val" in ''|*[!0-9]*) rm -f "$bak"; echo "滤波点数需为 1-9 的整数"; exit 1 ;; esac
+               [ "$val" -ge 1 ] && [ "$val" -le 9 ] || { rm -f "$bak"; echo "滤波点数需为 1-9"; exit 1; }
+               set_kv TEMP_FILTER "$val" ;;
+        hddmon|hddmonitor)
+               case "$(printf '%s' "$val" | tr 'A-Z' 'a-z')" in
+                   auto|on|off) set_kv HDD_MONITOR "$(printf '%s' "$val" | tr 'A-Z' 'a-z')" ;;
+                   *) rm -f "$bak"; echo "用法: oesp-fanctl set hddmon <auto|on|off>"; exit 1 ;;
+               esac ;;
         mode)  case "$val" in
                    auto|on|off) ;;
                    *) rm -f "$bak"; echo "用法: oesp-fanctl set mode <auto|on|off>"; exit 1 ;;
@@ -674,7 +875,7 @@ cmd_set() {
                else
                    printf 'FAN_MODE=%s\n' "$val" >> "$CONF"
                fi ;;
-        *) rm -f "$bak"; echo "用法: oesp-fanctl set <on|off|hdd|mode> <值>"; exit 1 ;;
+        *) rm -f "$bak"; echo "用法: oesp-fanctl set <on|off|hdd|mode|delay|ondelay|offdelay|filter|hddmon> <值>"; exit 1 ;;
     esac
     # 交叉校验：CPU 开启温度必须高于关闭温度，否则回滚（与 Web 页规则一致）
     local eon eoff
@@ -688,7 +889,7 @@ cmd_set() {
     fi
     rm -f "$bak"
     echo "已更新，守护进程 2 秒内自动生效："
-    grep -E "^(FAN_MODE|TEMP_ON|TEMP_OFF|HDD_ON_TEMP)=" "$CONF"
+    grep -E "^(FAN_MODE|TEMP_ON|TEMP_OFF|HDD_ON_TEMP|ON_DELAY|OFF_DELAY|TEMP_FILTER|HDD_MONITOR)=" "$CONF"
 }
 
 # ---------- 手动测试 ----------

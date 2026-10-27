@@ -29,10 +29,15 @@ EDITABLE = {
     "TEMP_ON": (20, 90), "TEMP_OFF": (10, 85),
     "HDD_ON_TEMP": (30, 70),
     "HDD_RUN_SECONDS": (30, 1800),
+    "ON_DELAY": (0, 300), "OFF_DELAY": (0, 300),
+    "TEMP_FILTER": (1, 9),
 }
-# 字符串型配置：FAN_MODE = auto(自动温控) / on(常开，一直运行) / off(常关)
+# 字符串型配置：
+#   FAN_MODE    = auto(自动温控) / on(常开，一直运行) / off(常关)
+#   HDD_MONITOR = auto(仅硬盘唤醒时读温度，不影响休眠) / on(始终读) / off(完全不读)
 EDITABLE_STR = {
     "FAN_MODE": ("auto", "on", "off"),
+    "HDD_MONITOR": ("auto", "on", "off"),
 }
 
 
@@ -75,11 +80,16 @@ def read_state():
             return default
     return {
         "cpu": tofloat("temp"),
+        "cpu_inst": tofloat("temp_inst"),
+        # 第二路温度：本机是 DDR 内存温度（旧版误标为 GPU），标签由守护进程给出
         "gpu": tofloat("gpu"),
+        "gpu_label": (st.get("gpu_label") or "GPU").strip() or "GPU",
         "disks": disks,
         "fan_state": toint("fan_state", 0),
         "fan_target": toint("fan_target", 0),
         "mode": st.get("mode", "auto"),
+        "hdd_monitor": (st.get("hdd_monitor") or "auto").strip().lower(),
+        "hdd_state": (st.get("hdd_state") or "ok").strip().lower(),
         "ts": toint("ts", 0),
     }
 
@@ -228,9 +238,9 @@ h1{font-size:20px;font-weight:700;letter-spacing:.5px}
 form{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end}
 .field{flex:1 1 150px;min-width:140px}
 .field label{display:block;font-size:12px;color:var(--txt2);margin-bottom:6px}
-.field input{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:#f8fafc;
+.field input,.field select{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:#f8fafc;
       color:var(--txt);font-size:15px;outline:none;transition:.2s;font-variant-numeric:tabular-nums}
-.field input:focus{border-color:var(--cyan);box-shadow:0 0 0 3px rgba(8,145,178,.12),0 0 12px rgba(8,145,178,.18)}
+.field input:focus,.field select:focus{border-color:var(--cyan);box-shadow:0 0 0 3px rgba(8,145,178,.12),0 0 12px rgba(8,145,178,.18)}
 /* 运行模式分段选择器 */
 .seg{display:flex;gap:6px;background:rgba(15,30,60,.05);padding:4px;border-radius:12px;border:1px solid var(--line)}
 .seg button{flex:1;padding:9px 10px;border:0;border-radius:9px;background:transparent;color:var(--txt2);
@@ -296,8 +306,21 @@ form{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end}
       </div>
       <div class="field"><label>CPU 开启温度（℃）</label><input id="TEMP_ON" type="number" min="20" max="90"></div>
       <div class="field"><label>CPU 关闭温度（℃）</label><input id="TEMP_OFF" type="number" min="10" max="85"></div>
+      <div class="field"><label>开启延迟（秒）</label><input id="ON_DELAY" type="number" min="0" max="300"></div>
+      <div class="field"><label>关闭延迟（秒）</label><input id="OFF_DELAY" type="number" min="0" max="300"></div>
       <div class="field"><label>硬盘开启温度（℃）</label><input id="HDD_ON_TEMP" type="number" min="30" max="70"></div>
       <div class="field"><label>硬盘通风时间（秒）</label><input id="HDD_RUN_SECONDS" type="number" min="30" max="1800"></div>
+      <div class="field" style="flex:1 1 100%">
+        <label>硬盘温度监控</label>
+        <select id="HDD_MONITOR">
+          <option value="auto">智能（仅硬盘唤醒时读取，不影响休眠）— 推荐</option>
+          <option value="on">始终读取（温度数据最全，但会持续唤醒硬盘）</option>
+          <option value="off">完全关闭（不碰硬盘，确保休眠；硬盘通风与硬盘兜底停用）</option>
+        </select>
+        <div class="hint" style="margin-top:7px">
+          开启/关闭延迟：温度需连续超过「开启温度」或低于「关闭温度」达设定秒数才动作，防止阈值附近频繁启停。
+        </div>
+      </div>
       <button class="save" type="submit">保存温度设置</button>
     </form>
     <div id="msg"></div>
@@ -318,6 +341,14 @@ let historyData = null;
 let diskLabels = [];
 let lastDiskKey = '';
 let lastCardsKey = '';
+let hddMonOff = false;   // 硬盘温度监控关闭时，历史曲线里的旧硬盘数据也不再绘制
+
+// 当前应绘制的序列：关闭硬盘监控时不画 d1/d2/d3（图例里也不会有，避免"有线无图例"）
+function activeKeys(){
+  const ks = ['cpu', 'gpu'];
+  if (!hddMonOff) ks.push('d1', 'd2', 'd3');
+  return ks.filter(k => visible[k]);
+}
 
 const BLADE = 'M24 24c-2-8 1.5-14 8-15c1 6.5-2 12-8 15z';
 const FAN_G = `<path d="${BLADE}" fill="#0ea5e9"/><path d="${BLADE}" transform="rotate(120 24 24)" fill="#0ea5e9" opacity=".8"/><path d="${BLADE}" transform="rotate(240 24 24)" fill="#0ea5e9" opacity=".6"/>`;
@@ -381,7 +412,16 @@ function fanCard(on, mode){
       <div class="lbl" style="margin-top:7px">模式 ${mtag}</div></div>
     </div></div>`;
 }
-function diskCards(disks){
+function diskCards(disks, hmon, hstate){
+  // 硬盘温度监控关闭：不显示一排「空」卡片，改为说明卡，避免误解成"硬盘坏了"
+  if (hmon === 'off') {
+    return `<div class="card" style="flex:1 1 100%">
+      <div class="c-head"><span class="c-name">硬盘温度监控已关闭</span>${ICO.hdd}</div>
+      <div style="font-size:13px;color:var(--txt3);line-height:1.75;padding:2px 0 4px">
+        当前不再读取硬盘温度，确保硬盘可以正常进入休眠。<br>
+        硬盘定时通风与硬盘过热兜底随之停用，风扇只按 CPU 温度控制。
+      </div></div>`;
+  }
   // 整行拉长：硬盘（平均）+ sda/sdb/sdc 各占一张卡片横排；额外识别到的盘追加；无数据/未插盘显示"空"
   const slots = ['sda', 'sdb', 'sdc'];
   const byName = {};
@@ -389,7 +429,14 @@ function diskCards(disks){
   disks.forEach(d => { if (!slots.includes(d.name)) slots.push(d.name); });
   const valid = slots.map(n => byName[n]).filter(t => t > 0);
   const avg = valid.length ? valid.reduce((a, b) => a + b, 0) / valid.length : null;
-  let html = tempCard('硬盘（平均）', avg, ICO.hdd);
+  let html = '';
+  if (hstate === 'asleep') {
+    html += `<div class="card" style="flex:1 1 100%;background:rgba(5,150,105,.06);border-color:rgba(5,150,105,.25)">
+      <div style="font-size:13px;color:#047857;line-height:1.7;padding:2px 0">
+        硬盘处于休眠状态，已自动跳过温度读取（不会把它唤醒）；唤醒后会立即恢复显示。
+      </div></div>`;
+  }
+  html += tempCard('硬盘（平均）', avg, ICO.hdd);
   html += slots.map(name => {
     const t = byName[name];
     if (t !== undefined && t !== null && t > 0) return tempCard(name, t, ICO.hdd);
@@ -424,27 +471,36 @@ async function refreshState(){
     const b = document.getElementById('fanbadge');
     if (s.fan_state === 1) { b.className = 'pill on'; document.getElementById('fanbadgeTxt').textContent = '风扇运行中'; }
     else { b.className = 'pill'; document.getElementById('fanbadgeTxt').textContent = '风扇已停止'; }
+    // 第二路温区标签由守护进程给出：本机 thermal_zone1 实为 DDR 内存，不是 GPU
+    const glabel = s.gpu_label || 'GPU';
+    if (NAMES.gpu !== glabel) { NAMES.gpu = glabel; if (historyData) drawChart(); }
+    // 硬盘监控关闭：曲线与图例里的硬盘序列一并隐藏
+    const hmOff = (s.hdd_monitor === 'off');
+    if (hmOff !== hddMonOff) { hddMonOff = hmOff; if (historyData) drawChart(); }
     diskLabels = s.disks.map(d => d.name);
     // 硬盘列表变化时重绘：图例要按实际盘位显示，否则首次加载只会有 CPU/GPU 两个图例
     const dk = diskLabels.join(',');
     if (dk !== lastDiskKey) { lastDiskKey = dk; if (historyData) drawChart(); }
     const samples = historyData ? historyData.cpu.length : 0;
-    const key = JSON.stringify([s.cpu, s.gpu, s.disks, s.fan_state, s.fan_target, s.mode, samples]);
+    const key = JSON.stringify([s.cpu, s.gpu, glabel, s.disks, s.fan_state, s.fan_target,
+                                s.mode, s.hdd_monitor, s.hdd_state, samples]);
     if (key !== lastCardsKey) {
       lastCardsKey = key;
       document.getElementById('cards').innerHTML =
         clockCard(samples) +
         fanCard(s.fan_state === 1, s.mode) +
         tempCard('CPU', s.cpu, ICO.chip) +
-        tempCard('GPU', s.gpu, ICO.gpu) +
-        diskCards(s.disks);
+        tempCard(glabel, s.gpu, ICO.gpu) +
+        diskCards(s.disks, s.hdd_monitor, s.hdd_state);
       tickClock();
     }
-    if (s.conf && !document.activeElement.matches('input')) {
-      for (const k of ['TEMP_ON', 'TEMP_OFF', 'HDD_ON_TEMP', 'HDD_RUN_SECONDS']) {
+    if (s.conf && !document.activeElement.matches('input,select')) {
+      for (const k of ['TEMP_ON', 'TEMP_OFF', 'ON_DELAY', 'OFF_DELAY', 'HDD_ON_TEMP', 'HDD_RUN_SECONDS']) {
         const el = document.getElementById(k);
         if (el && s.conf[k] !== undefined) el.value = s.conf[k];
       }
+      const hm = document.getElementById('HDD_MONITOR');
+      if (hm && s.conf.HDD_MONITOR) hm.value = s.conf.HDD_MONITOR;
       if (s.conf.FAN_MODE && !modeBusy) { curMode = s.conf.FAN_MODE; paintMode(); }
     }
   } catch(e) {}
@@ -482,7 +538,7 @@ function drawChart(){
   const padL = 40, padR = 12, padT = 12, padB = 26;
   const plotW = W - padL - padR, plotH = H - padT - padB;
   const all = [];
-  for (const k of ['cpu', 'gpu', 'd1', 'd2', 'd3']) if (visible[k]) all.push(...historyData[k]);
+  for (const k of activeKeys()) all.push(...historyData[k]);
   if (!all.length) return;
   const tMin = all[0][0], tMax = all[all.length - 1][0];
   let vMax = 0; all.forEach(p => { if (p[1] > vMax) vMax = p[1]; });
@@ -506,8 +562,7 @@ function drawChart(){
     ctx.fillText(lbl, X(t), H - 8);
   }
   // 序列（辉光线条 + 渐变面积）
-  for (const k of ['cpu', 'gpu', 'd1', 'd2', 'd3']) {
-    if (!visible[k]) continue;
+  for (const k of activeKeys()) {
     const pts = historyData[k]; if (pts.length < 2) continue;
     const color = COLORS[k];
     // 面积渐变
@@ -602,8 +657,10 @@ paintMode();
 async function saveCfg(ev){
   ev.preventDefault();
   const body = { FAN_MODE: curMode };
-  for (const k of ['TEMP_ON', 'TEMP_OFF', 'HDD_ON_TEMP', 'HDD_RUN_SECONDS'])
+  for (const k of ['TEMP_ON', 'TEMP_OFF', 'ON_DELAY', 'OFF_DELAY', 'HDD_ON_TEMP', 'HDD_RUN_SECONDS'])
     body[k] = parseInt(document.getElementById(k).value, 10);
+  const hm = document.getElementById('HDD_MONITOR');
+  if (hm) body.HDD_MONITOR = hm.value;
   if (body.TEMP_ON <= body.TEMP_OFF) { setMsg('CPU 开启温度必须高于关闭温度', '#dc2626'); return false; }
   try {
     const r = await fetch('api/config', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });

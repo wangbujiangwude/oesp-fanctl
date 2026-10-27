@@ -68,12 +68,30 @@ disk_t() {
     printf '%s' "${v:-?}"
 }
 
+# 硬盘温度展示：区分「监控已关闭」「硬盘休眠跳过」「正常读数」
+disk_text() {
+    case "$(sv hdd_monitor)" in
+        off)    printf '已关闭' ; return ;;
+    esac
+    case "$(sv hdd_state)" in
+        asleep) printf '休眠中' ; return ;;
+    esac
+    local v; v=$(disk_t)
+    case "$v" in
+        ''|'?'|0) printf '—' ;;
+        *)        printf '%s℃' "$v" ;;
+    esac
+}
+
 line() {
-    printf '[%s] 温度=%s℃ GPU=%s℃ 硬盘=%s℃ 风扇=%s 模式=%s\n' \
+    local gl
+    gl=$(sv gpu_label); [ -z "$gl" ] && gl="DDR"
+    printf '[%s] 温度=%s℃ %s=%s℃ 硬盘=%s 风扇=%s 模式=%s\n' \
         "$(date '+%F %T')" \
         "$(fmt_t "$CPU_NODE")" \
+        "$gl" \
         "$(fmt_t "$GPU_NODE")" \
-        "$(disk_t)" \
+        "$(disk_text)" \
         "$(fan_state)" \
         "$(fan_mode)"
 }
@@ -94,6 +112,8 @@ case "${1:-}" in
         echo "数据来源: $STATE"
         echo "运行模式: $(fan_mode)（auto=自动温控 / on=常开 / off=常关）"
         echo "CPU开启/关闭阈值: $(grep -oE '^TEMP_(ON|OFF)=[0-9]+' "$CONF" 2>/dev/null | tr '\n' ' ')"
+        echo "启停防抖: $(grep -oE '^(ON|OFF)_DELAY=[0-9]+' "$CONF" 2>/dev/null | tr '\n' ' ')"
+        echo "硬盘温度监控: $(sv hdd_monitor)（auto=仅唤醒时读 / on=始终读 / off=不读）"
         while :; do
             line
             sleep "$iv"
